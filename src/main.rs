@@ -1,4 +1,5 @@
 mod config;
+mod mods;
 mod ring;
 
 fn main() {
