@@ -14,6 +14,7 @@
 //!   静态只能拿到 `&self`，故走 `drain_impl`（`&self` 原子内核，T1.2 守恒测试
 //!   100k×10 并发验证过同模式）。
 
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, TranslateMessage, WM_APP,
 };
 
-use crate::config::Config;
+use crate::config::{Config, ENABLED};
 use crate::engine::{Action, DragState, EngineCfg, EngineEvent};
 use crate::hook;
 use crate::winmod;
@@ -64,7 +65,8 @@ pub fn run(cfg: Arc<Config>) {
             if n > 0 {
                 let events: Vec<EngineEvent> =
                     unsafe { (0..n).map(|i| buf[i].assume_init()).collect() };
-                if cfg.enabled {
+                // enabled 开关读原子镜像（T3.3：托盘线程翻转，Arc<Config> 不可原地改）。
+                if ENABLED.load(Ordering::Acquire) {
                     for ev in &events {
                         step(&mut state, ev, &cfg);
                     }

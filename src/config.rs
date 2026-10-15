@@ -6,9 +6,16 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 /// 触发修饰键默认值：VK_MENU (Alt) = 0x12。
 pub const DEFAULT_MODS: [u16; 1] = [0x12];
+
+/// 内存"启用"开关（`Config.enabled` 的 AtomicBool 镜像，T3.3 引入）：
+/// 托盘线程要翻转它、engine 线程要读它——`Arc<Config>` 内的 bool 不能原地
+/// 改（共享引用 UB），故开关走原子镜像；磁盘持久化仍由 `Config::save()` 承担。
+/// main 启动时按 `Config::load()` 初始化。
+pub static ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// 默认拖动策略。T2.3 spike（2026-10-15）实测定稿："fallback"——
 /// 远程 0xF012 在 explorer 上生效（B 按键变体 dx=160）但 notepad 失效，
@@ -55,6 +62,11 @@ impl Default for Config {
 fn config_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     PathBuf::from(appdata).join("anydrag-win").join("config.json")
+}
+
+/// 配置路径（T3.3 "Config…" 菜单项展示用）：`%APPDATA%\anydrag-win\config.json`。
+pub fn file_path() -> PathBuf {
+    config_path()
 }
 
 /// 读取配置。文件不存在/JSON 损坏 → 返回默认值并打印警告（不 panic、不退出）。
