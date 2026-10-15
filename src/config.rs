@@ -10,8 +10,10 @@ use std::path::PathBuf;
 /// 触发修饰键默认值：VK_MENU (Alt) = 0x12。
 pub const DEFAULT_MODS: [u16; 1] = [0x12];
 
-/// 默认拖动策略占位值。T2.3 spike 实测 0xF012 后在此定稿
-/// （notepad 与 explorer 均生效 → "native"，否则 "fallback"）。
+/// 默认拖动策略。T2.3 spike（2026-10-15）实测定稿："fallback"——
+/// 远程 0xF012 在 explorer 上生效（B 按键变体 dx=160）但 notepad 失效，
+/// 按 GOAL 判定规则（两者均生效才可用 native）落 fallback。
+/// 证据与复跑方法见 docs/spike-scandrag.md。
 const DEFAULT_STRATEGY: &str = "fallback";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -109,8 +111,9 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn tmp_dir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("anydrag-test-{}", std::process::id()));
+    /// 每个测试独立子目录（同进程 PID 相同，共享目录会让并发测试互踩文件）。
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("anydrag-test-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -130,7 +133,7 @@ mod tests {
 
     #[test]
     fn config_round_trip() {
-        let dir = tmp_dir();
+        let dir = tmp_dir("round_trip");
         let path = dir.join("config.json");
         let mut c = Config::default();
         c.native_excluded.push("notepad.exe".into());
@@ -144,7 +147,7 @@ mod tests {
 
     #[test]
     fn config_bad_json_falls_back_to_default() {
-        let dir = tmp_dir();
+        let dir = tmp_dir("bad_json");
         let path = dir.join("config.json");
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"{ this is : not json ").unwrap();
