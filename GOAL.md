@@ -1,0 +1,326 @@
+# GOAL — anydrag-win：Windows 版「Alt 拖窗口任意点移动」工具
+
+> 本文件是唯一的 goal 文档。一个零上下文的实现者只读本文档即可从头完成整个项目，
+> 交付物 = 一个能编译出可执行文件、且通过 §8 验收清单的仓库。
+> 许可证：MIT。clean-room 实现——行为参照 AnyDrag(macOS, GPL) 与 AltSnap(Windows, GPL-3.0)，
+> **不得复制二者的任何代码**，只可参照其行为与 API 设计。
+
+## 1. Goal
+
+构建一个 64 位 Windows 托盘工具 `anydrag-win.exe`：按住 **Alt**（可配置）在任意窗口客户区拖动即可像拖标题栏一样原生顺滑地移动窗口；Alt+双击（无位移）最大化/还原；支持按应用排除与「原生 / 回退」双拖动策略。
+
+**MVP 范围内**：拖动移动（双策略）+ 双击最大化/还原 + 排除表 + 托盘开关/退出 + 配置持久化。
+**MVP 范围外（后续迭代，勿做）**：分屏面板、就近角 resize、中键方向分屏、Win11 snap 联动（0xF023/0xF024）、i18n、自动更新、逐应用偏移调优、提权模式。
+
+## 2. Context / Assumptions（2026-10-15 已在本机核实）
+
+| 事实 | 值 |
+|---|---|
+| 宿主 | Windows 11，git-bash（MSYS）shell，目标平台 x86_64 |
+| Rust | `rustc 1.98.1` / `cargo 1.98.1`，默认 target `x86_64-pc-windows-msvc`（唯一安装 target） |
+| MSVC | VS 2022 **BuildTools**：`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`，VC 工具链 `14.44.35207`，`vcvarsall.bat` 位于 `...\VC\Auxiliary\Build\` |
+| Windows SDK | `C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0` |
+| git 身份 | 已配置（user.name=Light26） |
+| PATH 上的 `link.exe` | 是 git-bash 自带的，**不是** MSVC linker；cargo 链接 MSVC 目标前必须先 `call vcvarsall.bat x64` |
+
+构建入口（全项目统一用这两条，git-bash 中 `cmd //c` 双斜杠是 MSYS 路径转义陷阱的解法）：
+
+```bash
+# debug 验证
+cmd //c 'call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 && cargo build'
+# release 验收
+cmd //c 'call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 && cargo build --release'
+```
+
+若本机 MSVC 目录变化，用 vswhere 定位：
+`"/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath` 再拼 `VC\Auxiliary\Build\vcvarsall.bat`。
+
+## 3. 架构（3 句话 + 线程模型）
+
+3 个线程：**main**（DPI 感知 + 托盘 + 隐藏回调窗）；**hook 线程**（装 `WH_MOUSE_LL` 低级鼠标钩子并跑自己的消息泵；钩子回调只允许 O(1) 无堆分配——把事件塞进 64 槽固定 SPSC 环形缓冲 + `PostThreadMessage` 发固定信号，绝不在此做任何 FFI 重活）；**engine 线程**（自己的 `GetMessage` 消息泵，消费环形缓冲，驱动纯函数状态机，执行 FFI 动作）。
+
+核心机制 = **双拖动策略**（与 AltSnap 纯 `SetWindowPos` 路线的差异化）：
+- **Native 策略**：触发时向目标窗口 `PostMessage(hwnd, WM_SYSCOMMAND, 0xF012 /* SC_DRAGMOVE = SC_MOVE|HTCAPTION */, 0)`，目标应用自己的消息泵跑原生 caption 拖动循环 → 逐帧零 IPC，compositor 级顺滑（= macOS AnyDrag 的 window-server 技巧）。**0xF012 为未文档化但数十年稳定行为，且"跨进程 PostMessage 是否生效"必须在实现时用 spike 实测**（T2.3），spike 结果决定默认策略。
+- **Fallback 策略**：hook 移动事件驱动 `SetWindowPos`，engine 线程合并每次只应用最新位移；在 fallback 路径上先给目标发 `WM_SIZING`（ALT 修饰位）再 `SetWindowPos`，让终端等应用正确 reflow。
+
+关键不变量（写代码时刻在）：
+1. 进程启动**第一个** FFI 调用必须是 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`；之后所有坐标（钩子/窗口框/绘制）统一物理像素。
+2. 窗口可见几何一律用 `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`，**禁止**用 `GetWindowRect` 做数学（标准窗口有 ~7px 隐形 resize 边框，会污染角落/zone 计算）。
+3. 钩子回调 O(1)、无堆分配、无阻塞 FFI；重活全部 PostThreadMessage 出去。
+4. 目标窗口解析：`WindowFromPoint` 后过滤 `!IsWindowVisible`、`WS_EX_TOOLWINDOW`；应用身份 = `GetWindowThreadProcessId` → `OpenProcess(QUERY_INFORMATION|QUERY_LIMITED)` + `QueryFullProcessImageNameW`。
+5. 按应用的策略/排除表是产品面，不是 afterthought：`native_excluded`（完全无视手势）与 `fallback_apps`（强制回退）两份列表存配置。
+
+## 4. 仓库布局（目标终态）
+
+```
+anydrag-win/
+├── GOAL.md                  # 本文件（保留，勿改）
+├── README.md                # 用途/构建/使用（T4.3）
+├── build.bat                # vcvarsall x64 + cargo build --release（T0.2）
+├── Cargo.toml               # T0.1
+├── docs/
+│   └── spike-scandrag.md    # T2.3 实测结论（默认策略依据）
+├── src/
+│   ├── main.rs              # T3.4
+│   ├── config.rs            # T1.1
+│   ├── ring.rs              # T1.2（SPSC 环形缓冲，纯逻辑可单测）
+│   ├── mods.rs              # T1.3（修饰键匹配，纯逻辑可单测）
+│   ├── engine.rs            # T1.4/T1.5（DragState 状态机 + Action，纯逻辑可单测）
+│   ├── winmod.rs            # T2.1/T2.2（FFI 封装 + syscommand 常量）
+│   ├── hook.rs              # T3.1（WH_MOUSE_LL + 钩子线程消息泵）
+│   ├── engine_loop.rs       # T3.2（engine 线程：消费 ring、执行 Action、排除表）
+│   ├── tray.rs              # T3.3（Shell_NotifyIcon + 隐藏回调窗 + 菜单）
+│   └── bin/
+│       └── probe_scandrag.rs  # T2.3（0xF012 spike 探针二进制）
+└── tests/                   # 集成测试（如有）
+```
+
+## 5. 依赖（Cargo.toml，T0.1 完整内容）
+
+```toml
+[package]
+name = "anydrag-win"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_WindowsProgramming",
+] }
+serde     = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "probe_scandrag"
+path = "src/bin/probe_scandrag.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+strip = true
+```
+
+> **feature 名漂移逃生门**：`windows-sys` 各版本 feature 名偶有增删。若 cargo 报
+> `feature ... not found`，错误信息里会列出**全部**合法 feature 名——从错误里抄，
+> 不要凭记忆改。若 0.61 拉不到（本机无网/registry 缓存问题），按 cargo 报错里的
+> 可用版本就近调整（0.59–0.63 语义一致）。
+
+## 6. 任务列表（每个任务 = 1 次 commit；TDD 任务先红后绿）
+
+约定：所有命令在仓库根目录、git-bash 中执行；构建类命令一律走 §2 的 `cmd //c` 包装；
+commit 信息格式 `T#. # <摘要>`。
+
+---
+
+### Phase 0 — 脚手架与工具链闸门
+
+**T0.1 初始化 cargo 项目**
+- 仓库根目录执行：`cargo init --bin`
+- 把 `Cargo.toml` 整体替换为 §5 内容（删除 cargo 生成的 hello-world `src/main.rs` 先留着，本任务不改）。
+- 验证：`cmd //c 'call "...vcvarsall.bat" x64 && cargo check'` → 期望 `Finished dev profile`（无 error；此时 main.rs 还是 hello-world 但依赖全部可编译 = 依赖与 feature 正确）。
+- commit `T0.1 cargo scaffold + deps`。
+
+**T0.2 build.bat**
+- 新建 `build.bat`：
+```bat
+@echo off
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+cargo build --release %*
+```
+- 验证：`cmd //c "build.bat"` → 期望 `Finished release profile` 且 `test -f target/release/anydrag-win.exe && echo OK` 输出 `OK`。
+- **这一步是工具链闸门**：若 link 失败，只排查 MSVC 环境（vcvarsall 路径、x64），**不要**改投 GNU/mingw target。
+- commit `T0.2 build.bat + toolchain gate`。
+
+### Phase 1 — 纯核心（TDD：先写失败测试 → `cargo test <name>` 见失败 → 最小实现 → 绿 → commit）
+
+**T1.1 `src/config.rs` + 测试**
+- 结构体（serde，全部 `#[serde(default)]`）：
+```rust
+pub const DEFAULT_MODS: [u16; 1] = [0x12]; // VK_MENU (Alt)
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct Config {
+    pub enabled: bool,                  // 默认 true
+    pub modifiers: Vec<u16>,            // VK 码列表，要求"全部按下"才算触发；默认 [Alt]
+    pub drag_threshold_px: u32,         // 默认 5
+    pub double_click_ms: Option<u32>,    // None = 用 GetDoubleClickTime()；默认 None
+    pub default_strategy: String,       // "native" | "fallback"，由 T2.3 spike 结论写入
+    pub native_excluded: Vec<String>,   // 进程文件名（小写）→ 手势完全无视
+    pub fallback_apps: Vec<String>,     // 进程文件名 → 强制 fallback 策略
+}
+```
+- `load() -> Config`：路径 `%APPDATA%\anydrag-win\config.json`（`std::env::var("APPDATA")` 手拼，不引 directories crate）；文件不存在/损坏 → 返回默认并打印警告；`save(&self)` 创建父目录后原子写（先写 `.tmp` 再 rename）。
+- 测试（`#[cfg(test)]`）：默认值断言；round-trip（save→load 相等）；坏 JSON 回退默认。
+- 验证：`cargo test config` 全绿。commit `T1.1 config`。
+
+**T1.2 `src/ring.rs` — 固定大小 SPSC 环形缓冲（纯逻辑，重单测）**
+- `pub struct Ring<T, const N: usize>`：`AtomicUsize` head/tail + `unsafe` 存储槽；`push` 满则丢最旧（计数），`drain(&mut self, out: &mut [MaybeUninit<T>]) -> usize`。
+- 无锁单生产者单消费者（生产者 = hook 线程，消费者 = engine 线程），构造文档写死该前提。
+- 测试：顺序入出、满时丢旧、乱序并发（2 线程 100k 事件计数守恒）。
+- commit `T1.2 ring`。
+
+**T1.3 `src/mods.rs`（纯逻辑）**
+- `pub fn matches(down_mask: u16, required: &[u16]) -> bool`：`required` 中每个 VK 的 bit（bit 索引 = `VK & 0x1F`，VK 码 ≤ 0x1F 直接按位；`VK_SHIFT/Ctrl/Alt` 高位码按 `VK & 0x1F` 映射到 mask 位——实现时按 Windows 修饰键 VK=0x10/0x11/0x12/0xA0 的 `& 0x1F` 规则写注释）全部置位才 true；`required` 为空视为不触发。
+- 测试：Alt 单键、Alt+Ctrl 组合要求、多余按键不阻挡（只要求 configured 的键按下，不要求其他键没按——YAGNI，注释写明）。
+- commit `T1.3 mods`。
+
+**T1.4 `src/engine.rs` — DragState 状态机（纯逻辑，项目大脑）**
+- 类型定义（照抄，实现 `feed`）：
+```rust
+pub struct Target { pub hwnd: isize, pub exe: String, pub frame: [i32; 4] } // DWM 可见 bounds L,T,R,B
+#[derive(Clone, Copy, PartialEq)] pub enum Strategy { Native, Fallback }
+pub enum Action {
+    None,
+    BeginNativeDrag,            // → PostMessage(hwnd, WM_SYSCOMMAND, SC_DRAGMOVE, 0)
+    SetPos { x: i32, y: i32 },  // → 先 WM_SIZING(ALT) 后 SetWindowPos(hwnd, x, y, 保持大小)
+    Maximize,                   // → PostMessage(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0)
+    Restore,                    // → PostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+    End,                        // → 状态回 Idle
+}
+pub enum EngineEvent {
+    Down { x: i32, y: i32, mods: u16 },
+    Move { x: i32, y: i32, mods: u16 },
+    Up   { x: i32, y: i32, mods: u16 },
+}
+pub enum DragState {
+    Idle,
+    /// 已按下（修饰齐全），等待：位移≥阈值 → 提交拖动；双 down 无位移 → 双击
+    Armed { target: Target, start: [i32; 2], down_seq: u8, strategy: Strategy },
+    Native { target: Target },
+    Fallback { target: Target },
+}
+```
+- `pub fn feed(&mut self, ev: &EngineEvent, resolve: &dyn Fn(i32, i32) -> Option<Target>, cfg: &EngineCfg) -> Vec<Action>`，`EngineCfg { modifiers_mask: u16, threshold_px: u32, double_click_ms: u32 }`。
+- 规则（逐条写注释，单测逐条钉死）：
+  1. 非修饰齐全 / `enabled=false` → 全部事件忽略，返回 `[None]`；
+  2. `Down` 且修饰齐全：`resolve(x,y)` 失败（无窗口/排除表）→ `Idle`；成功 → `Armed`（`down_seq=1`；若 500ms 内第二次 `Down` 同目标且位移 < 阈值 → 返回 `[Maximize, End]`，已是最大化状态则 `[Restore, End]`——最大化判断由 `resolve` 返回的 Target 携带 `is_maximized: bool` 字段表达，加进 `Target`）；
+  3. `Move` 且 `Armed`：位移 ≥ 阈值 → 提交：`Native` 策略返回 `[BeginNativeDrag, End]`（`End` 仅表示"armed 阶段结束"，进入 `Native` 态）；`Fallback` 策略进入 `Fallback` 态并按 `start` 帧 + 位移返回 `[SetPos{...}]`；
+  4. `Fallback` 态下每个 `Move` 返回一个 `SetPos`（x = `target.frame[0] + (ev.x - start.x)`，y 同理；engine 线程侧只应用最后一个——合并逻辑在 T3.2，状态机本身每事件出一条，测试断言坐标计算正确）；
+  5. 任意 `Up` → `[End]` 回 `Idle`；
+  6. 双击判定窗口用 `cfg.double_click_ms`，测试注入固定值。
+- 测试（≥8 个，每条规则至少 1 个，命名 `engine_*`）：先写 1 个规则 2 的失败测试示例：
+```rust
+#[test]
+fn double_down_no_motion_maximizes() {
+    let mut s = DragState::Idle;
+    let cfg = EngineCfg::test(); // modifiers_mask = Alt, threshold 5, dbl 500ms
+    let resolve = |_x, _y| Some(Target::test_notepad(false)); // is_maximized=false
+    let a1 = s.feed(&EngineEvent::Down { x: 100, y: 200, mods: MOD_ALT }, &resolve, &cfg);
+    assert_eq!(a1, vec![Action::None]);
+    let a2 = s.feed(&EngineEvent::Down { x: 100, y: 200, mods: MOD_ALT }, &resolve, &cfg);
+    assert_eq!(a2, vec![Action::Maximize, Action::End]);
+}
+```
+- 验证：`cargo test engine_` 全绿。commit `T1.4 drag state machine`。
+
+### Phase 2 — FFI 层 + 关键 spike
+
+**T2.1 `src/winmod.rs` — P/Invoke 安全封装**（FFI 无 TDD，以 `cargo check` 通过 + 手动探针为验证）
+- `pub fn dpi_aware_v2()`：`SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`，注明"必须是进程首个 FFI 调用"。
+- `pub fn frame_bounds(hwnd) -> Option<[i32;4]>`：`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`。
+- `pub fn exe_name(hwnd) -> Option<String>`：`GetWindowThreadProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` → `QueryFullProcessImageNameW(0)` → 取文件名片段并转小写。
+- `pub fn resolve_target(x, y, cfg) -> Option<Target>`：`WindowFromPoint` + `IsWindowVisible` + `GetWindowLongW(GWL_EXSTYLE)` 过滤 toolwindow + 排除表（`native_excluded`）+ `frame_bounds` + `exe_name` + `is_maximized`（`GetWindowPlacement` 的 `showCmd == SW_SHOWMINIMIZED/SW_SHOWMAXIMIZED`，或 `GetWindowLong` 的 `WS_MAXIMIZEBOX` 位 + 比较 frame 与 monitor——MVP 简化：`frame 等于所属 monitor 工作区` 即视为最大化态，注释写明简化）+ 策略选择（`fallback_apps` 命中→`Fallback`，否则 `cfg.default_strategy`）。
+- `pub fn post_sys_command(hwnd, cmd)`、常量 `SC_DRAGMOVE=0xF012`、`SC_MAXIMIZE=0xF030`、`SC_RESTORE=0xF120`、`WM_SIZING=0x0231`。
+- 验证：`cmd //c '...vcvarsall... && cargo check'` 无 error。commit `T2.1 winmod FFI`。
+
+**T2.2 `SetWindowPos` 回退执行器**
+- `pub fn fallback_move(hwnd, x, y)`：`PostMessageW(hwnd, WM_SIZING, 0x0001 /* 标记含 ALT，让应用 reflow */, 0)` 后 `SetWindowPos(hwnd, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER)`；hwnd 有效性守卫（`IsWindow`）。
+- 验证：`cargo check`。commit `T2.2 fallback mover`。
+
+**T2.3 spike：`src/bin/probe_scandrag.rs` → `docs/spike-scandrag.md`（本任务决定默认策略，必须先做完才写 engine_loop）**
+- 探针行为：`CreateProcessW("notepad.exe")` → 等 `GetWindowPlacement` 可见 → 取 DWM 帧 → 用 `SendInput` 把鼠标移到客户区中央 → `PostMessage(hwnd, WM_SYSCOMMAND, 0xF012, 0)` → 再 `SendInput` 移动鼠标 +80px → 50ms 后读 DWM 帧对比：窗口位移 ≈ 鼠标位移 = **remote 0xF012 生效**；不动 = 失效。
+- 对 `notepad` / `explorer`(打开一个资源管理器窗口) / 一个 Chromium 系应用（若装了 Edge 就测 `msedge --window-size=800,600 about:blank`）各跑一遍，把结果表写进 `docs/spike-scandrag.md`：每个应用的"生效/失效 + 结论"。
+- **决策规则（写进文档末尾）**：notepad 与 explorer 均生效 → `config.default_strategy = "native"`；否则 = `"fallback"`。把该值写入默认 `Config`（T1.1 的 `default()` 在此时定稿）。
+- commit `T2.3 spike + default strategy decision`。
+
+### Phase 3 — 活系统
+
+**T3.1 `src/hook.rs`**
+- `pub fn spawn() -> engine_tid`：新线程内 `SetWindowsHookExW(WH_MOUSE_LL, Some(ll_proc), 0, 0)` + 自己的 `GetMessageW` 泵；`ll_proc`（`unsafe extern "system"`）仅：`code>=0` 且消息 ∈ {WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE} 时，取 `MSLLHOOKSTRUCT`，用 `GetAsyncKeyState` 读 configured VK 组装 `mods` mask，`RING.push(...)` + `PostThreadMessageW(engine_tid, WM_APP, 0, 0)`，最后无条件 `CallNextHookEx`。禁止堆分配/阻塞。
+- 验证：`cargo check` + 手动跑 2 秒无卡顿（`mouse_move 卡顿`无感知即过）。commit `T3.1 hook thread`。
+
+**T3.2 `src/engine_loop.rs`**
+- `pub fn run(cfg: Arc<Config>)`：`GetMessageW` 泵；收 `WM_APP` → `RING.drain` → 逐事件转 `EngineEvent` → `DragState::feed` → 执行 `Action`（`BeginNativeDrag`→`post_sys_command(SC_DRAGMOVE)`；`SetPos` 同事件内多条**只执行最后一条**；`Maximize/Restore`→syscommand；`End`→状态回 Idle 清理）。`enabled=false` 时仍泵但 feed 恒 None。
+- 验证：`cargo check`。commit `T3.2 engine loop`。
+
+**T3.3 `src/tray.rs`**
+- 隐藏 message-only 窗（`RegisterClassExW` + `CreateWindowExW(WS_POPUP)`）接收托盘回调（`u32` 自定义 `WM_APP+100`）；`Shell_NotifyIconW(NIM_ADD)`（图标用 `LoadImageW(0, IDI_APPLICATION, ...)`，不内嵌资源文件，YAGNI）；菜单 `CreatePopupMenu` + 三项：**Enable/Disable**（切 `cfg.enabled` 并写回）、**Config…**（弹 `msgbox` 显示配置文件路径，MVP 不做 GUI 编辑）、**Quit**（`NIM_DELETE` + 退出）。
+- 验证：`cargo check`。commit `T3.3 tray`。
+
+**T3.4 `src/main.rs` 接线**
+```rust
+fn main() {
+    winmod::dpi_aware_v2();                      // 必须是第一个 FFI 调用
+    let cfg = Arc::new(Config::load());
+    let engine_tid = engine_loop::run_in_thread(cfg.clone()); // 内部 spawn hook 线程并绑定 tid
+    tray::install(&cfg);                          // main 线程跑托盘消息泵
+}
+```
+- 验证（手动冒烟，逐项过才 commit）：
+  1. 跑 `target/release/anydrag-win.exe` → 托盘出现；
+  2. 打开 notepad，按住 Alt 在客户区中间拖 → 窗口跟手移动（native 策略下移动顺滑、无逐帧卡顿；fallback 下可用、允许轻微开销感）；
+  3. Alt+双击（不拖）→ 最大化；再次 → 还原；
+  4. 配置 `native_excluded: ["notepad.exe"]` 保存 → notepad 对手势无反应，其他窗口正常；
+  5. 托盘 Disable → 全部手势失效；Quit → 进程退出、托盘消失。
+- commit `T3.4 main wiring + smoke pass`。
+
+### Phase 4 — 验收与收尾
+
+**T4.1 全量回归**
+- `cargo test`（全部）→ 期望全绿（≥14 个测试）；`cmd //c "build.bat"` → `Finished release profile`；`ls -la target/release/anydrag-win.exe` 存在。
+- commit `T4.1 full regression`。
+
+**T4.2 最终 release 与自检**
+- `cmd //c "build.bat"`（release）后，运行 §8 验收清单逐条打勾，结果追加到 `docs/acceptance.md`。
+- commit `T4.2 acceptance evidence`。
+
+**T4.3 `README.md`**
+- 一段用途 + 特性表（MVP 范围）+ 构建（`build.bat`）+ 使用（Alt 拖 / Alt 双击 / 托盘）+ 配置字段表（T1.1 的 Config 逐字段）+ "已知边界"（elevated 窗口不可见、Secure Desktop 钩子失效、游戏建议加入排除）。
+- commit `T4.3 readme`。
+
+## 7. 编码规范（给零上下文实现者）
+
+- 每任务独立 commit；commit 前必须 `cargo check`（FFI 任务）或 `cargo test`（纯逻辑任务）通过。
+- 纯逻辑模块（ring/mods/engine/config）零 `windows-sys` 导入——这是可单测性的边界，违反即坏设计。
+- 所有 FFI 集中在 `winmod.rs`，其他模块只调它。
+- 注释写"为什么"（不变量、spike 依据、简化决策），不写"做了什么"。
+- 遇到 cargo 报 feature/符号缺失：按 §5 逃生门从错误信息里取合法名；仍无解则在该任务 commit 里写明阻塞，**不要**静默换方案。
+
+## 8. Definition of Done（验收人早上检查这 8 条）
+
+1. `git log --oneline` 含 T0.1…T4.3 全部 commit，`GOAL.md` 未被改动。
+2. `cmd //c "build.bat"` 末尾输出 `Finished release profile`，且 `target/release/anydrag-win.exe` 存在（≈ 数百 KB 量级，strip 后）。
+3. `cargo test` 全绿（ring ×3、config ×3、mods ×2、engine ×≥6）。
+4. 手动冒烟 §T3.4 五项通过（notepad 拖动、双击最大化还原、排除表、托盘开关、退出）。
+5. `docs/spike-scandrag.md` 存在，且其结论与 `Config::default().default_strategy` 一致。
+6. 配置落在 `%APPDATA%\anydrag-win\config.json`，改后重启生效。
+7. 托盘三项菜单可用（Enable/Config/Quit）。
+8. 无 `TODO` 未决：全仓 `grep -rn "TODO" src/` 应为空（阻塞项必须已记录在对应 commit 里）。
+
+## 9. 风险与开放问题（按严重度）
+
+| # | 风险 | 缓解 |
+|---|---|---|
+| 1 | **remote `PostMessage 0xF012` 是否生效未知**（未文档化行为） | T2.3 spike 前置；失效则默认策略=fallback（功能仍完整，只是顺滑度降级），native 策略保留给实测生效的应用（按应用表） |
+| 2 | 无边框 Chromium/Electron 窗口无 `WS_CAPTION`，native 路径可能失败 | 自动落入 fallback（`resolve_target` 对失败应用记入 `fallback_apps` 的思路留给后续迭代；MVP 由用户手动加） |
+| 3 | LL 钩子在 Secure Desktop（UAC/登录）失效 | 非优雅降级（钩子静默断，进程存活）；日志 `eprintln!`，MVP 不处理恢复 |
+| 4 | 非提权进程对 elevated 窗口 UIPI 不可见 | 文档声明，不做提权模式（后续） |
+| 5 | windows-sys feature 名版本漂移 | §5 逃生门（从 cargo 错误抄合法 feature） |
+| 6 | 高 DPI 热插拔/多屏 | 启动时 Per-Monitor v2 声明已覆盖 99%；热插拔边角留后续 |
+| 7 | 游戏 RawInput/DirectInput 把手势当普通输入 | 文档建议把游戏加进 `native_excluded`；MVP 不做进程类型嗅探 |
+| 8 | 双击判定依赖系统 `GetDoubleClickTime`（可被用户改系统值） | 允许配置 `double_click_ms` 覆盖（T1.1 已有字段） |
+
+**开放问题（不阻塞 MVP，记录即可）**：(a) `SC_DRAGMOVE` 时若目标窗口当前处于 Win11 snap 态，原生拖动会自动取消 snap——是否符合预期需冒烟时确认；(b) fallback 路径 `WM_SIZING` 的 lParam 参数是否必须携带 `HTCAPTION|HTLEFT` 等 hit 码，AltSnap 传 0 亦工作，MVP 传 0 并注释。
