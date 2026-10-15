@@ -63,6 +63,14 @@ pub fn load() -> Config {
 }
 
 impl Config {
+    /// 构造"触发所需修饰键"mask：bit = `VK & 0x1F`（与 mods.rs / hook.rs 同一位规则；
+    /// u32 加宽见 mods.rs 模块注记）。engine_loop 每次 feed 现算（O(≤4) 位运算）。
+    pub fn modifiers_mask(&self) -> u32 {
+        self.modifiers
+            .iter()
+            .fold(0u32, |m, &vk| m | 1u32 << (vk & 0x1F))
+    }
+
     /// 原子写：先写同目录 `.json.tmp` 再 rename——避免托盘写回时半截文件毁掉配置。
     pub fn save(&self) {
         if let Err(e) = save_to(self, &config_path()) {
