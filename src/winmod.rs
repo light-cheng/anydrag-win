@@ -170,6 +170,26 @@ pub fn post_sys_command(hwnd: isize, cmd: u32) {
     }
 }
 
+/// T2.2 回退执行器：hwnd 有效性守卫 + WM_SIZING(ALT 标记) + SetWindowPos 保持大小。
+pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
+    let h: HWND = hwnd as *mut c_void;
+    unsafe {
+        if IsWindow(h) == 0 {
+            return;
+        }
+        PostMessageW(h, WM_SIZING, 0x0001, 0);
+        SetWindowPos(
+            h,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+}
+
 /// 系统双击间隔（ms）：配置 double_click_ms=None 时由调用方用此值解析。
 pub fn system_double_click_ms() -> u32 {
     unsafe { GetDoubleClickTime() }
