@@ -49,6 +49,9 @@ pub enum Action {
     Maximize,
     /// → `PostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE=0xF120, 0)`。
     Restore,
+    /// 中键方向分屏：把窗口吸附到 `zone` 对应的半屏/四分之一屏
+    /// （执行器按目标显示器工作区算矩形，见 `winmod::snap_to_zone`）。
+    SnapTo(SnapZone),
     /// 手势结束：状态回 Idle，执行器清理。
     End,
 }
@@ -58,6 +61,9 @@ pub enum EngineEvent {
     Down { x: i32, y: i32, mods: u32 },
     Move { x: i32, y: i32, mods: u32 },
     Up { x: i32, y: i32, mods: u32 },
+    /// 中键按下 / 抬起（中键方向分屏手势）。中键不参与修饰键判定。
+    MiddleDown { x: i32, y: i32 },
+    MiddleUp { x: i32, y: i32 },
 }
 
 /// 状态机持有的状态。
@@ -94,6 +100,12 @@ pub enum DragState {
         start: [i32; 2],
         edges: u8,
     },
+    /// 中键已按下、等待抬起判定分屏方向（方向在**抬起时**才决定，
+    /// 这样用户拖动过程中可以改主意，且未达阈值的普通中键点击不受影响）。
+    MiddleArmed {
+        target: Target,
+        start: [i32; 2],
+    },
 }
 
 /// 状态机每次 feed 的配置快照（engine 线程从共享 Config 现取现算，
@@ -109,6 +121,10 @@ pub struct EngineCfg {
     pub threshold_px: u32,
     /// 双击判定窗口（ms）；None 配置在调用方解析为系统 GetDoubleClickTime()。
     pub double_click_ms: u32,
+    /// 中键方向分屏开关。
+    pub middle_snap: bool,
+    /// 中键分屏的方向判定阈值（px）；两轴位移都小于它 = 普通中键点击，不干预。
+    pub middle_threshold_px: u32,
 }
 
 impl Default for DragState {
@@ -194,6 +210,63 @@ fn nearest_corner(t: &Target, x: i32, y: i32) -> u8 {
         e |= RZ_BOTTOM;
     }
     e
+}
+
+// ===== 中键方向分屏（2026-10-16 用户要求）=====
+
+/// 中键拖拽松手后要吸附到的区域（纯逻辑；实际矩形由执行器按目标显示器工作区计算）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SnapZone {
+    LeftHalf,
+    RightHalf,
+    TopHalf,
+    BottomHalf,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// 由中键拖拽向量判定分屏区域。
+/// - 两轴位移都小于 `threshold_px` → `None`（视为普通中键点击，**不干预**应用自己的
+///   中键粘贴/滚动行为——这是本手势能安全默认开启的前提）。
+/// - 方向判定：与主轴夹角 ≤30° 归为该轴对应的"半屏"，否则归为"对角四分之一屏"。
+///   用 `tan(30°)≈0.577` 的整数比较避免浮点（纯逻辑模块要求可确定复现）。
+pub fn zone_from_drag(dx: i32, dy: i32, threshold_px: u32) -> Option<SnapZone> {
+    let adx = dx.unsigned_abs() as u64;
+    let ady = dy.unsigned_abs() as u64;
+    if adx == 0 && ady == 0 {
+        return None;
+    }
+    if adx < threshold_px as u64 && ady < threshold_px as u64 {
+        return None;
+    }
+    let horizontal = adx * 1000 >= ady * 577;
+    let vertical = ady * 1000 >= adx * 577;
+    let left = dx < 0;
+    let up = dy < 0;
+    Some(match (horizontal, vertical) {
+        (true, false) => {
+            if left {
+                SnapZone::LeftHalf
+            } else {
+                SnapZone::RightHalf
+            }
+        }
+        (false, true) => {
+            if up {
+                SnapZone::TopHalf
+            } else {
+                SnapZone::BottomHalf
+            }
+        }
+        _ => match (left, up) {
+            (true, true) => SnapZone::TopLeft,
+            (false, true) => SnapZone::TopRight,
+            (true, false) => SnapZone::BottomLeft,
+            (false, false) => SnapZone::BottomRight,
+        },
+    })
 }
 
 /// 由"起点帧 + 起点光标 + 当前光标"算新窗口矩形（相对 start 累计，
@@ -457,6 +530,44 @@ impl DragState {
                     vec![Action::End]
                 }
             }
+
+            // ===== 中键方向分屏（方向在抬起时判定，见 DragState::MiddleArmed）=====
+            EngineEvent::MiddleDown { x, y } => {
+                if !cfg.middle_snap {
+                    return vec![Action::None];
+                }
+                match resolve(*x, *y) {
+                    Some(target) => {
+                        *self = DragState::MiddleArmed {
+                            target,
+                            start: [*x, *y],
+                        };
+                    }
+                    None => *self = DragState::Idle,
+                }
+                vec![Action::None]
+            }
+
+            EngineEvent::MiddleUp { x, y } => {
+                let zone = match self {
+                    DragState::MiddleArmed { start, .. } => {
+                        zone_from_drag(*x - start[0], *y - start[1], cfg.middle_threshold_px)
+                    }
+                    _ => None,
+                };
+                *self = DragState::Idle;
+                match zone {
+                    // 吸附包在尺寸调整相位里，让目标应用按最终尺寸正确重排。
+                    Some(z) => vec![
+                        Action::BeginSizeMove,
+                        Action::SnapTo(z),
+                        Action::EndSizeMove,
+                        Action::End,
+                    ],
+                    // 未达阈值 = 普通中键点击：本工具不干预（应用自己的中键行为照常）。
+                    None => vec![Action::End],
+                }
+            }
         }
     }
 }
@@ -479,6 +590,8 @@ mod tests {
                 threshold_px: 5,
                 double_click_ms: 500,
                 resize_mask: 0,
+                middle_snap: true,
+                middle_threshold_px: 40,
             }
         }
     }
@@ -932,5 +1045,73 @@ mod tests {
         assert_eq!(a1.len(), 2, "commit frame = BeginSizeMove + SetPos");
         let a2 = s.feed(&move_(120, 200, MOD_ALT), &resolve_fallback(), &cfg);
         assert_eq!(a2, vec![Action::SetPos { x: 120, y: 100 }]);
+    }
+
+    // ===== 中键方向分屏 =====
+
+    #[test]
+    fn middle_zone_direction_table() {
+        // 阈值 40：主轴（与主轴夹角 ≤30°）→ 半屏；对角 → 四分之一屏；未达阈值 → None。
+        let t = 40;
+        assert_eq!(zone_from_drag(-100, 0, t), Some(SnapZone::LeftHalf));
+        assert_eq!(zone_from_drag(100, 0, t), Some(SnapZone::RightHalf));
+        assert_eq!(zone_from_drag(0, -100, t), Some(SnapZone::TopHalf));
+        assert_eq!(zone_from_drag(0, 100, t), Some(SnapZone::BottomHalf));
+        assert_eq!(zone_from_drag(100, -100, t), Some(SnapZone::TopRight));
+        assert_eq!(zone_from_drag(-100, -100, t), Some(SnapZone::TopLeft));
+        assert_eq!(zone_from_drag(-100, 100, t), Some(SnapZone::BottomLeft));
+        assert_eq!(zone_from_drag(100, 100, t), Some(SnapZone::BottomRight));
+        // 斜度小的仍算主轴（dy 只有 dx 的 1/10）。
+        assert_eq!(zone_from_drag(100, -10, t), Some(SnapZone::RightHalf));
+        assert_eq!(zone_from_drag(10, -100, t), Some(SnapZone::TopHalf));
+        // 未达阈值（两轴都 < 40）→ None = 普通中键点击，不干预。
+        assert_eq!(zone_from_drag(10, 10, t), None);
+        assert_eq!(zone_from_drag(0, 0, t), None);
+        assert_eq!(zone_from_drag(39, 0, t), None);
+    }
+
+    #[test]
+    fn middle_drag_snaps_on_release() {
+        let mut s = DragState::Idle;
+        let cfg = EngineCfg::test();
+        assert_eq!(
+            s.feed(&EngineEvent::MiddleDown { x: 300, y: 300 }, &resolve_ok(false), &cfg),
+            vec![Action::None]
+        );
+        assert!(matches!(s, DragState::MiddleArmed { .. }));
+        // 拖动过程中不产生动作（方向到抬起才定，允许中途改主意）。
+        assert_eq!(s.feed(&move_(300, 200, 0), &resolve_ok(false), &cfg), vec![Action::None]);
+        assert!(matches!(s, DragState::MiddleArmed { .. }));
+        // 向左上抬起到达阈值 → 吸附左上四分之一屏。
+        assert_eq!(
+            s.feed(&EngineEvent::MiddleUp { x: 200, y: 200 }, &resolve_ok(false), &cfg),
+            vec![
+                Action::BeginSizeMove,
+                Action::SnapTo(SnapZone::TopLeft),
+                Action::EndSizeMove,
+                Action::End
+            ]
+        );
+        assert!(matches!(s, DragState::Idle));
+    }
+
+    #[test]
+    fn middle_click_without_drag_is_left_alone() {
+        // 未达阈值的普通中键点击：不产生吸附动作（应用自己的中键粘贴/滚动不受影响）。
+        let mut s = DragState::Idle;
+        let cfg = EngineCfg::test();
+        s.feed(&EngineEvent::MiddleDown { x: 300, y: 300 }, &resolve_ok(false), &cfg);
+        let a = s.feed(&EngineEvent::MiddleUp { x: 305, y: 303 }, &resolve_ok(false), &cfg);
+        assert_eq!(a, vec![Action::End]);
+        assert!(matches!(s, DragState::Idle));
+    }
+
+    #[test]
+    fn middle_snap_disabled_by_config() {
+        let mut s = DragState::Idle;
+        let mut cfg = EngineCfg::test();
+        cfg.middle_snap = false;
+        s.feed(&EngineEvent::MiddleDown { x: 300, y: 300 }, &resolve_ok(false), &cfg);
+        assert!(matches!(s, DragState::Idle), "disabled middle snap must not arm");
     }
 }

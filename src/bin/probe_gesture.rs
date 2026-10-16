@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -19,12 +19,14 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, SendInput,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, SendInput,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetSystemMetrics, GetWindowTextW, IsWindowVisible, PostMessageW,
-    SetForegroundWindow, SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_CLOSE,
+    EnumWindows, GetAncestor, GetSystemMetrics, GetWindowPlacement, GetWindowTextW, IsWindowVisible,
+    PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos, WindowFromPoint, GA_ROOT,
+    HWND_NOTOPMOST, HWND_TOPMOST, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_MAXIMIZE, WINDOWPLACEMENT, WM_CLOSE,
 };
 
 const VK_MENU: u16 = 0x12;
@@ -108,11 +110,13 @@ fn find_window(sub: &str) -> Option<HWND> {
     (v != 0).then(|| v as HWND)
 }
 
-/// 把目标窗抬到 Z 序最前再测。**必要前置**：若测试窗被置顶/全屏窗遮挡（2026-10-16
-/// 实测：本机远程桌面客户端 gameviewer.exe 有全屏窗），引擎的命中测试会解析到遮挡窗
-/// 而不是测试窗，所有手势测出来都是 dx=0 的假 FAIL。probe_scandrag 早已有
-/// `SetForegroundWindow`，本驱动此前漏了这一步。
-fn raise_target(hwnd: HWND) {
+/// 把目标窗抬到 Z 序最前再测，并**确认它确实在最前**。返回 false = 被别的窗口遮挡。
+///
+/// **为什么必须有这道守卫**：引擎的命中测试解析的是"光标下最顶层的可拖窗口"，而不是
+/// 本驱动以为的那个窗口。2026-10-16 实测教训——中键分屏冒烟时，光标下的顶层窗口是
+/// 全屏的远程桌面客户端 `GameViewer.exe`，结果**把用户的远程桌面窗口吸附成了半屏**。
+/// 宁可中止，不可误伤：任何手势驱动前都先确认目标窗真的在最上面。
+fn raise_target(hwnd: HWND) -> bool {
     unsafe {
         SetWindowPos(
             hwnd,
@@ -123,6 +127,16 @@ fn raise_target(hwnd: HWND) {
         SetForegroundWindow(hwnd);
     }
     std::thread::sleep(Duration::from_millis(250));
+    // 用窗口中心做代理点校验：该点下的根窗口必须是目标窗本身。
+    let Some(f) = frame_of(hwnd) else { return false };
+    let (cx, cy) = ((f[0] + f[2]) / 2, (f[1] + f[3]) / 2);
+    unsafe {
+        let under = WindowFromPoint(POINT { x: cx, y: cy });
+        if under.is_null() {
+            return false;
+        }
+        GetAncestor(under, GA_ROOT) == GetAncestor(hwnd, GA_ROOT)
+    }
 }
 
 /// 测完恢复非置顶（不改动用户窗口的置顶状态）；窗口已关（close 子命令）时静默失败。
@@ -152,6 +166,18 @@ fn mouse_button(down: bool) {
         MOUSEEVENTF_LEFTDOWN
     } else {
         MOUSEEVENTF_LEFTUP
+    };
+    unsafe {
+        mouse_input(0, 0, flags, 0);
+    }
+}
+
+/// 中键按下/抬起（中键方向分屏冒烟用）。
+fn mouse_middle(down: bool) {
+    let flags = if down {
+        MOUSEEVENTF_MIDDLEDOWN
+    } else {
+        MOUSEEVENTF_MIDDLEUP
     };
     unsafe {
         mouse_input(0, 0, flags, 0);
@@ -205,8 +231,16 @@ fn main() {
         eprintln!("window not found: {sub}");
         std::process::exit(2);
     };
-    // 先抬到最前：否则被全屏/置顶窗遮挡时，引擎命中测试解析到的是遮挡窗（见 raise_target）。
-    raise_target(hwnd);
+    // 先抬到最前并**校验确实在最前**：否则引擎的命中测试会解析到遮挡窗，
+    // 手势就会作用到别的窗口上（见 raise_target 的安全说明）。
+    if !raise_target(hwnd) {
+        eprintln!(
+            "中止：目标窗 '{sub}' 被其他窗口遮挡（该点下的顶层窗口不是它）。\n\
+             为避免误伤其他窗口，本驱动不会继续。\n\
+             本机常见原因：全屏的远程桌面客户端窗口盖住了整个桌面。"
+        );
+        std::process::exit(3);
+    }
     let f0 = frame_of(hwnd).expect("dwm frame");
     match cmd {
         "frame" => {
@@ -309,6 +343,52 @@ fn main() {
             let dw = (f1[2] - f1[0]) - (f0[2] - f0[0]);
             println!("ctrl-resize: w0={} w1={} (cmd +{RZ_DRAG_PX}px)", f0[2] - f0[0], f1[2] - f1[0]);
             println!("CTRL_RESIZE={}", if dw >= 40 { "PASS" } else { "FAIL" });
+        }
+        "middle-snap" => {
+            // 中键从窗口中心**向左**拖 200px 后松开 → 期望吸附到工作区左半屏。
+            // 判据：窗口左缘贴近工作区左缘，且宽度约为工作区的一半（容差 20px，
+            // 因为 SetWindowPlacement 写的是外框矩形，DWM 可见框内缩约 7px）。
+            let cx = (f0[0] + f0[2]) / 2;
+            let cy = (f0[1] + f0[3]) / 2;
+            mouse_move_abs(cx, cy);
+            std::thread::sleep(Duration::from_millis(80));
+            mouse_middle(true);
+            std::thread::sleep(Duration::from_millis(60));
+            for i in 1..=4 {
+                mouse_move_abs(cx - 200 * i / 4, cy);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            mouse_middle(false);
+            std::thread::sleep(Duration::from_millis(600));
+            let f1 = frame_of(hwnd).expect("dwm frame");
+            let wa = work_area();
+            let half_w = (wa[2] - wa[0]) / 2;
+            let left_ok = (f1[0] - wa[0]).abs() <= 20;
+            let width_ok = ((f1[2] - f1[0]) - half_w).abs() <= 20;
+            println!(
+                "middle-snap: after=[{f1:?}] work_area=[{wa:?}] expect_left_half_w={half_w}"
+            );
+            println!(
+                "MIDDLE_SNAP={} (left_ok={left_ok}, width_ok={width_ok})",
+                if left_ok && width_ok { "PASS" } else { "FAIL" }
+            );
+        }
+        "maximize" => {
+            // 把窗口置为最大化。用途：冒烟测试可能改动了窗口几何（例如中键分屏把测试目标
+            // 换成别的窗口），用它一键复位；也方便手动恢复。
+            unsafe {
+                let mut wndpl: WINDOWPLACEMENT = std::mem::zeroed();
+                wndpl.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                if GetWindowPlacement(hwnd, &mut wndpl) != 0 {
+                    wndpl.showCmd = SW_MAXIMIZE as u32;
+                    SetWindowPlacement(hwnd, &wndpl);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let f1 = frame_of(hwnd).expect("dwm frame");
+            let wa = work_area();
+            println!("maximize: hwnd=0x{:x} after=[{f1:?}] work_area=[{wa:?}]", hwnd as isize);
+            println!("MAXIMIZE=OK");
         }
         "close" => {
             unsafe {

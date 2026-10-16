@@ -8,7 +8,7 @@
 //! `*mut c_void` 的 type alias（不是 tuple struct，不能 `HWND(...)` 构造）。
 
 use crate::config::Config;
-use crate::engine::{Strategy, Target};
+use crate::engine::{SnapZone, Strategy, Target};
 use std::ffi::c_void;
 use windows_sys::core::PWSTR;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, RECT};
@@ -372,6 +372,57 @@ pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
 /// 系统双击间隔（ms）：配置 double_click_ms=None 时由调用方用此值解析。
 pub fn system_double_click_ms() -> u32 {
     unsafe { GetDoubleClickTime() }
+}
+
+/// 中键方向分屏的落地（`Action::SnapTo`）：把窗口吸附到目标显示器**工作区**里
+/// `zone` 对应的半屏/四分之一屏。
+///
+/// 用 `SetWindowPlacement` 一次完成"还原 + 摆位"（AltSnap `RestoreWindowToRect` 手法，
+/// `hooks.c:1321-1345`）：`showCmd = SW_RESTORE` 处理最大化/最小化态，
+/// `rcNormalPosition` 写目标矩形。比"先 Restore 再 SetWindowPos"可靠——后者两步都是
+/// 异步的，顺序不保证。
+pub fn snap_to_zone(hwnd: isize, zone: SnapZone) {
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
+    unsafe {
+        if IsWindow(hwnd_ptr) == 0 {
+            return;
+        }
+        let mon = MonitorFromWindow(hwnd_ptr, MONITOR_DEFAULTTONEAREST);
+        if mon.is_null() {
+            return;
+        }
+        let mut mi = std::mem::zeroed::<MONITORINFO>();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut mi) == 0 {
+            return;
+        }
+        // 以工作区左上角为原点的局部坐标，再平移到屏幕坐标。
+        let w = mi.rcWork.right - mi.rcWork.left;
+        let h = mi.rcWork.bottom - mi.rcWork.top;
+        let (l, t, r, b) = match zone {
+            SnapZone::LeftHalf => (0, 0, w / 2, h),
+            SnapZone::RightHalf => (w / 2, 0, w, h),
+            SnapZone::TopHalf => (0, 0, w, h / 2),
+            SnapZone::BottomHalf => (0, h / 2, w, h),
+            SnapZone::TopLeft => (0, 0, w / 2, h / 2),
+            SnapZone::TopRight => (w / 2, 0, w, h / 2),
+            SnapZone::BottomLeft => (0, h / 2, w / 2, h),
+            SnapZone::BottomRight => (w / 2, h / 2, w, h),
+        };
+        let mut wndpl: WINDOWPLACEMENT = std::mem::zeroed();
+        wndpl.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd_ptr, &mut wndpl) == 0 {
+            return;
+        }
+        wndpl.showCmd = SW_RESTORE as u32;
+        wndpl.rcNormalPosition = RECT {
+            left: mi.rcWork.left + l,
+            top: mi.rcWork.top + t,
+            right: mi.rcWork.left + r,
+            bottom: mi.rcWork.top + b,
+        };
+        SetWindowPlacement(hwnd_ptr, &wndpl);
+    }
 }
 
 /// 回退 resize 执行器（engine `Action::SetRect` 的落地，同 fallback_move 范式）：

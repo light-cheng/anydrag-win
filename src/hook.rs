@@ -20,7 +20,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, MSLLHOOKSTRUCT, PostThreadMessageW,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WM_APP, WM_LBUTTONUP,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE, WH_MOUSE_LL,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WH_MOUSE_LL,
 };
 
 use crate::engine::EngineEvent;
@@ -94,7 +94,12 @@ fn hook_thread() {
 unsafe extern "system" fn ll_proc(nCode: i32, wParam: usize, lParam: isize) -> isize {
     if nCode >= 0 {
         let msg = wParam as u32;
-        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEMOVE {
+        if msg == WM_LBUTTONDOWN
+            || msg == WM_LBUTTONUP
+            || msg == WM_MBUTTONDOWN
+            || msg == WM_MBUTTONUP
+            || msg == WM_MOUSEMOVE
+        {
             let info = lParam as *const MSLLHOOKSTRUCT;
             let x = (*info).pt.x;
             let y = (*info).pt.y;
@@ -113,6 +118,10 @@ unsafe extern "system" fn ll_proc(nCode: i32, wParam: usize, lParam: isize) -> i
             let ev = match msg {
                 WM_LBUTTONDOWN => EngineEvent::Down { x, y, mods },
                 WM_LBUTTONUP => EngineEvent::Up { x, y, mods },
+                // 中键不参与修饰键判定（分屏手势是"裸中键拖拽"，见 engine 的
+                // EngineEvent::MiddleDown/MiddleUp）。
+                WM_MBUTTONDOWN => EngineEvent::MiddleDown { x, y },
+                WM_MBUTTONUP => EngineEvent::MiddleUp { x, y },
                 _ => EngineEvent::Move { x, y, mods },
             };
             RING.push(ev);

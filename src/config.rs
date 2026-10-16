@@ -51,6 +51,12 @@ pub struct Config {
     pub native_excluded: Vec<String>,
     /// 进程文件名 → 强制 fallback 策略。
     pub fallback_apps: Vec<String>,
+    /// 中键方向分屏开关（2026-10-16 用户要求）。true 时：按住中键拖动超过
+    /// `middle_snap_threshold_px` 再松开 → 窗口吸附到该方向对应的半屏/四分之一屏。
+    /// 未达阈值的中键点击**不干预**（应用自己的中键粘贴/滚动照常）。
+    pub middle_snap: bool,
+    /// 中键分屏的方向判定阈值（px）：拖拽位移两个轴都小于它 = 普通中键点击。
+    pub middle_snap_threshold_px: u32,
 }
 
 // Default 手写而非 derive：derive 会给 enabled=false / modifiers=[]，
@@ -66,6 +72,8 @@ impl Default for Config {
             default_strategy: DEFAULT_STRATEGY.to_string(),
             native_excluded: Vec::new(),
             fallback_apps: Vec::new(),
+            middle_snap: true,
+            middle_snap_threshold_px: 40,
         }
     }
 }

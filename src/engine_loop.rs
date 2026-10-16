@@ -100,7 +100,8 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
         | DragState::Native { target }
         | DragState::Fallback { target, .. }
         | DragState::ArmedResize { target, .. }
-        | DragState::Resize { target, .. } => Some(target.hwnd),
+        | DragState::Resize { target, .. }
+        | DragState::MiddleArmed { target, .. } => Some(target.hwnd),
         DragState::Idle => None,
     };
     let ecfg = EngineCfg {
@@ -110,6 +111,8 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
         resize_mask: cfg.resize_mask(),
         threshold_px: cfg.drag_threshold_px,
         double_click_ms: cfg.double_click_ms.unwrap_or_else(winmod::system_double_click_ms),
+        middle_snap: cfg.middle_snap,
+        middle_threshold_px: cfg.middle_snap_threshold_px,
     };
     let resolve = |x: i32, y: i32| winmod::resolve_target(x, y, cfg);
     let actions = state.feed(ev, &resolve, &ecfg);
@@ -177,6 +180,12 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
             Action::Restore => {
                 if let Some(h) = pre_hwnd {
                     winmod::set_placement_max_restore(h, false);
+                }
+                gesture_done = true;
+            }
+            Action::SnapTo(zone) => {
+                if let Some(h) = pre_hwnd {
+                    winmod::snap_to_zone(h, zone);
                 }
                 gesture_done = true;
             }
