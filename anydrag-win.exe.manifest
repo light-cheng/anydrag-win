@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  comctl32 v6 视觉样式清单（外部 manifest，与 anydrag-win.exe 同目录即生效）。
+
+  为什么需要它：Rust windows-sys 项目默认不带任何 manifest，系统按 comctl32 v5
+  渲染所有标准控件（按钮/复选框/下拉框）= Windows 95 灰色方角样式。依赖本清单后
+  切到 v6，同一份代码的控件立刻变成 Win11 现代样式（圆角按钮、现代复选框等），
+  零代码改动、零构建依赖。
+
+  分发注意：exe 拷贝/打包时必须带上同名的 .exe.manifest 文件（build.rs 会在每次
+  构建时自动复制到 target/release/ 旁边）。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
