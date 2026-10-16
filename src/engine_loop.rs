@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, TranslateMessage, WM_APP,
+    DispatchMessageW, GetMessageW, KillTimer, SetTimer, TranslateMessage, WM_APP, WM_TIMER,
 };
 
 use crate::config::{self, Config, ENABLED};
@@ -49,6 +49,57 @@ pub fn run_in_thread(cfg: Arc<Config>) -> u32 {
     tid
 }
 
+/// 待落地的几何更新（节流用）。
+///
+/// **为什么节流（2026-10-16 缩放延迟的根因，实测数据）**：对 Edge（4000 个卡片的页面）
+/// 以约 160 次/秒灌缩放请求时，窗口在最后一次鼠标移动之后**还在继续变化 314ms**，
+/// 且最终宽度比期望少 18px —— 说明我们发得比目标应用重排得快，它的消息队列越堆越多，
+/// 窗口永远追不上光标。引擎侧只有 5 个批次超过 8ms，所以瓶颈不在我们这边，而是**灌太多**。
+/// 移动之所以顺滑，是因为移动只让窗口管理器挪一下表面、应用几乎不干活。
+/// 对策：几何更新节流到显示器刷新周期，中间态直接丢掉——每次下发的都是**绝对**几何
+/// （`start + 位移`），丢掉中间帧不会累积误差。AltSnap 的 `conf.RefreshRate` 是同一招。
+#[derive(Clone, Copy, Debug)]
+enum Geom {
+    Pos { x: i32, y: i32 },
+    Rect { x: i32, y: i32, w: i32, h: i32 },
+}
+
+/// 节流器定时器 id（线程定时器，`SetTimer(NULL, …)`，不需要窗口）。
+const THROTTLE_TIMER: usize = 0xA17D;
+
+/// 下发一次几何更新，返回**本次请求的窗口矩形**（供背压判断"目标是否已追上"）。
+///
+/// 缩放路径这里还做了一次**坐标语义换算**：engine 算出的目标矩形是 **DWM 帧**
+/// (`EXTENDED_FRAME_BOUNDS`) 语义，而 `SetWindowPos` 接受的是**窗口矩形**——两者相差
+/// 左右下各约 7px 的不可见边框。旧版直接当窗口矩形下发，结果比预期大 7px（既有偏差）；
+/// 现按实测内缩量换算，既修正了尺寸，也让背压的等值比较成立。
+fn apply_geom(g: Geom, hwnd: Option<isize>) -> Option<[i32; 4]> {
+    let h = hwnd?;
+    if std::env::var_os("ANYDRAG_DEBUG").is_some() {
+        // 注意与 `[engine]` 行的区别：那行是**状态机输出的动作**（每个事件一条），
+        // 这行才是**真正下发到目标窗口的次数**——节流/背压是否生效看这个。
+        eprintln!("[apply] {g:?}");
+    }
+    match g {
+        Geom::Pos { x, y } => {
+            let cur = winmod::window_rect(h)?;
+            let (w, hh) = (cur[2] - cur[0], cur[3] - cur[1]);
+            winmod::fallback_move(h, x, y);
+            Some([x, y, x + w, y + hh])
+        }
+        Geom::Rect { x, y, w, h: hh } => {
+            let win = winmod::window_rect(h)?;
+            let dwn = winmod::frame_bounds(h)?;
+            let (dl, dt) = (dwn[0] - win[0], dwn[1] - win[1]);
+            let (dr, db) = (win[2] - dwn[2], win[3] - dwn[3]);
+            let (wx, wy) = (x - dl, y - dt);
+            let (ww, wh) = (w + dl + dr, hh + dt + db);
+            winmod::fallback_resize(h, wx, wy, ww, wh);
+            Some([wx, wy, wx + ww, wy + wh])
+        }
+    }
+}
+
 /// engine 线程消息泵（`pub`：`run_in_thread` 的线程体；也供单测直接驱动）。
 pub fn run(cfg: Arc<Config>) {
     let mut state = DragState::Idle;
@@ -56,11 +107,38 @@ pub fn run(cfg: Arc<Config>) {
     // 这里检测到变化就刷新快照并同步钩子的监视键列表 —— 即"改完即时生效"。
     let mut live: Config = (*cfg).clone();
     let mut live_ver = config::version();
+    // 几何节流/背压状态（见 `Geom` 注释）。
+    let frame_ms = winmod::refresh_interval_ms();
+    let mut pending: Option<(Geom, Option<isize>)> = None;
+    let mut last_apply: Option<std::time::Instant> = None;
+    // 上一次**请求**的窗口矩形：用于判断目标应用是否已经把它落地了。
+    let mut req: Option<[i32; 4]> = None;
+    let mut timer_armed = false;
     let mut msg: _ = unsafe { core::mem::zeroed() };
     loop {
         let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if r <= 0 {
             break; // 0 = WM_QUIT；-1 = 错误——两种都退泵（进程随 main 退出，LL 钩子自动卸载）。
+        }
+        // 节流定时器到点 → 重试把被推迟的那次几何落地
+        // （目标还没追上的话，下个定时器再试；这是背压的重试节拍）。
+        if msg.message == WM_TIMER {
+            if timer_armed {
+                unsafe { KillTimer(std::ptr::null_mut(), THROTTLE_TIMER) };
+                timer_armed = false;
+            }
+            if let Some((g, h)) = pending.take() {
+                if caught_up(req, h) {
+                    req = apply_geom(g, h);
+                    last_apply = Some(std::time::Instant::now());
+                } else {
+                    pending = Some((g, h));
+                    unsafe {
+                        SetTimer(std::ptr::null_mut(), THROTTLE_TIMER, frame_ms as u32, None)
+                    };
+                    timer_armed = true;
+                }
+            }
         }
         if msg.message == WM_APP {
             // 热重载检查（无锁读一个原子；无变化时零开销）。
@@ -80,7 +158,32 @@ pub fn run(cfg: Arc<Config>) {
                 // enabled 开关读原子镜像（T3.3：托盘线程翻转，Arc<Config> 不可原地改）。
                 if ENABLED.load(Ordering::Acquire) {
                     for ev in &events {
-                        step(&mut state, ev, &live);
+                        let (geom, hwnd) = step(&mut state, ev, &live);
+                        let Some(g) = geom else { continue };
+                        // 抬起事件必须落地（手势收尾不能留中间态）；
+                        // 其余要同时满足：距上次下发 ≥ 刷新周期 **且** 目标已追上上次请求。
+                        let is_up = matches!(ev, EngineEvent::Up { .. });
+                        let due = match last_apply {
+                            None => true,
+                            Some(t) => t.elapsed().as_millis() as u64 >= frame_ms,
+                        };
+                        if is_up || (due && caught_up(req, hwnd)) {
+                            req = apply_geom(g, hwnd);
+                            last_apply = Some(std::time::Instant::now());
+                            pending = None;
+                            if timer_armed {
+                                unsafe { KillTimer(std::ptr::null_mut(), THROTTLE_TIMER) };
+                                timer_armed = false;
+                            }
+                        } else {
+                            // 推迟：中间态丢弃（几何是绝对的，不累积误差），
+                            // 由定时器在目标追上后补发最新值。
+                            pending = Some((g, hwnd));
+                            unsafe {
+                                SetTimer(std::ptr::null_mut(), THROTTLE_TIMER, frame_ms as u32, None)
+                            };
+                            timer_armed = true;
+                        }
                     }
                 } else if !matches!(state, DragState::Idle) {
                     // 运行中被 Disable：状态回 Idle（GOAL"feed 恒 None"的清理语义）。
@@ -95,9 +198,20 @@ pub fn run(cfg: Arc<Config>) {
     }
 }
 
+/// 背压判断：目标窗口的当前矩形是否已经等于上一次请求的矩形。
+/// 不等 = 目标应用还在消化上一帧（重排/重绘没做完），此时再灌只会让它的队列越堆越长。
+fn caught_up(req: Option<[i32; 4]>, hwnd: Option<isize>) -> bool {
+    match (req, hwnd) {
+        (Some(r), Some(h)) => winmod::window_rect(h).map(|c| c == r).unwrap_or(true),
+        // 没有历史请求 / 拿不到窗口 → 不拦。
+        _ => true,
+    }
+}
+
 /// 单事件一步：feed + 执行动作（`&cfg` 现取现算快照）。
+/// 返回**待落地的几何更新**（由 `run()` 的节流器决定何时下发，见 `Geom`）与目标 hwnd。
 /// `ANYDRAG_DEBUG=1` 时向 stderr 打印每事件动作（冒烟/验收诊断用，默认静默）。
-fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
+fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>, Option<isize>) {
     // 动作执行需要的目标 hwnd：feed 会改状态（如双击 Armed→Idle），故**先**快照。
     let pre_hwnd: Option<isize> = match state {
         DragState::Armed { target, .. }
@@ -150,6 +264,7 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     // 只有鼠标抬起事件才算手势收尾：提交帧（Armed → Fallback/Resize）也会带一条
     // `Action::End`，但那只是"armed 相位结束"，此时发伪装会提前释放用户按着的键。
     let is_up = matches!(ev, EngineEvent::Up { .. });
+    let t_exec = std::time::Instant::now();
     for a in actions {
         match a {
             Action::None => {}
@@ -211,16 +326,19 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
             }
         }
     }
-    if let Some((x, y)) = last_setpos {
-        if let Some(h) = pre_hwnd {
-            winmod::fallback_move(h, x, y);
+    // 耗时仪表（诊断缩放延迟用）：本批次"执行动作"花了多久。移动只是挪表面、目标应用
+    // 几乎不干活（约 1ms）；缩放要目标应用按新尺寸重排+重绘，成本全在它那边——这里能量到。
+    if std::env::var_os("ANYDRAG_DEBUG").is_some() {
+        let ms = t_exec.elapsed().as_millis();
+        if ms >= 8 {
+            eprintln!("[engine] 执行耗时 {ms}ms（被目标应用的重排/重绘拖住）");
         }
     }
-    if let Some((rx, ry, rw, rh, _edges)) = last_setrect {
-        if let Some(h) = pre_hwnd {
-            // edges 不再下传：旧版把它翻成 WMSZ_* 塞进一条跨进程 WM_SIZING（且消息号
-            // 还是错的），2026-10-16 已改为用 BeginSizeMove/EndSizeMove 表达相位。
-            winmod::fallback_resize(h, rx, ry, rw, rh);
-        }
+    // 几何更新**不在这里落地**——交给 run() 的节流器（见 `Geom` 注释）：
+    // 同一事件内多条只保留最后一条（合并，GOAL T3.2）。
+    match (last_setpos, last_setrect) {
+        (_, Some((x, y, w, h, _edges))) => (Some(Geom::Rect { x, y, w, h }), pre_hwnd),
+        (Some((x, y)), None) => (Some(Geom::Pos { x, y }), pre_hwnd),
+        _ => (None, pre_hwnd),
     }
 }

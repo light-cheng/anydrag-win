@@ -23,6 +23,7 @@ use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, VREFRESH};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
 };
@@ -376,9 +377,45 @@ pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
     }
 }
 
+/// 窗口矩形（`GetWindowRect`，含不可见边框）。**只用于"目标是否已追上上次请求"的
+/// 背压判断**与"把 DWM 帧矩形换算成窗口矩形"——几何计算仍一律以 DWM 帧为准。
+pub fn window_rect(hwnd: isize) -> Option<[i32; 4]> {
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
+    unsafe {
+        if IsWindow(hwnd_ptr) == 0 {
+            return None;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd_ptr, &mut r) == 0 {
+            return None;
+        }
+        Some([r.left, r.top, r.right, r.bottom])
+    }
+}
+
 /// 系统双击间隔（ms）：配置 double_click_ms=None 时由调用方用此值解析。
 pub fn system_double_click_ms() -> u32 {
     unsafe { GetDoubleClickTime() }
+}
+
+/// 显示器刷新周期（ms），用作几何更新的节流间隔。
+///
+/// **为什么需要它（2026-10-16 缩放延迟的根因）**：实测对 Edge（4000 个卡片的页面）
+/// 以 ~160 次/秒灌缩放请求时，窗口在最后一次鼠标移动之后**还在继续变化 314ms**
+/// —— 我们发得比目标应用重排得快，它的消息队列越堆越多，窗口永远追不上光标。
+/// 移动之所以顺滑，是因为移动只让窗口管理器挪一下表面、应用几乎不干活。
+/// 节流到刷新率后，发出的请求数 ≤ 屏幕能呈现的帧数，队列不再堆积。
+/// AltSnap 的 `conf.RefreshRate`（`ASleep(RefreshRate)`，注释 "Accurate!!!"）就是同一招。
+pub fn refresh_interval_ms() -> u64 {
+    unsafe {
+        let hdc = GetDC(0 as _);
+        let hz = GetDeviceCaps(hdc, VREFRESH as i32).max(0) as u64;
+        ReleaseDC(0 as _, hdc);
+        // VREFRESH 在部分驱动上返回 0/1（"默认"），按 60Hz 处理；夹到 [4, 33]ms
+        // 防呆（250Hz~30Hz），避免驱动报怪值时把节流关掉或拖成幻灯片。
+        let hz = if hz < 20 { 60 } else { hz };
+        (1000 / hz).clamp(4, 33)
+    }
 }
 
 /// 中键方向分屏的落地（`Action::SnapTo`）：把窗口吸附到目标显示器**工作区**里

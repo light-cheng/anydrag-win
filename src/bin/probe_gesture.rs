@@ -400,6 +400,92 @@ fn main() {
             println!("send-save: posted WM_COMMAND(ID_SAVE) to 0x{:x}", hwnd as isize);
             println!("SEND_SAVE=OK");
         }
+        "resize-bench" => {
+            // 缩放延迟基准：以约 200Hz 注入 40 步 × 5px（共 200px）的拖动，随后轮询窗口
+            // 几何直到稳定，报出「最后一次注入鼠标移动之后，窗口还在继续变化多久」
+            // —— 这就是用户能感觉到的"追不上光标"的延迟量。
+            // 与 alt-drag 对照：同样的注入率下移动几乎瞬时收敛，缩放会暴露目标应用重排的代价。
+            let w0 = f0[2] - f0[0];
+            let rx = f0[0] + w0 * 3 / 4;
+            let ry = (f0[1] + f0[3]) / 2;
+            key_event(VK_MENU, false);
+            key_event(VK_CONTROL, false);
+            mouse_move_abs(rx, ry);
+            std::thread::sleep(Duration::from_millis(80));
+            mouse_button(true);
+            std::thread::sleep(Duration::from_millis(60));
+            let t0 = std::time::Instant::now();
+            for i in 1..=40 {
+                mouse_move_abs(rx + 5 * i, ry);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let inject_ms = t0.elapsed().as_millis();
+            // 轮询直到几何连续 120ms 不变
+            let mut last_w = i32::MIN;
+            let mut last_change = std::time::Instant::now();
+            loop {
+                let w = frame_of(hwnd).map(|f| f[2] - f[0]).unwrap_or(-1);
+                if w != last_w {
+                    last_w = w;
+                    last_change = std::time::Instant::now();
+                }
+                if last_change.elapsed().as_millis() >= 120 {
+                    break;
+                }
+                if t0.elapsed().as_millis() > 8000 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let settle_ms = last_change.duration_since(t0).as_millis();
+            mouse_button(false);
+            key_event(VK_CONTROL, true);
+            key_event(VK_MENU, true);
+            println!(
+                "resize-bench: w0={w0} w_final={last_w} expected≈{} 注入用时={inject_ms}ms 追上用时={settle_ms}ms",
+                w0 + 200
+            );
+            println!("RESIZE_BENCH_DONE");
+        }
+        "native-resize" => {
+            // **对照实验**：用户抱怨"还不如直接用鼠标去边缘缩放"，那就真的去边缘拖。
+            // 光标放到窗口右边框（DWM 帧外那圈 ~7px 不可见边框里）按下左键拖动——
+            // 这是**完全原生**的缩放路径（应用自己的 modal loop 驱动），
+            // 注入序列与 resize-bench 完全相同，量同样的"追上用时"，直接 A/B。
+            let w0 = f0[2] - f0[0];
+            let bx = f0[2] + 3; // 右边框：DWM 帧右侧再往外 3px
+            let by = (f0[1] + f0[3]) / 2;
+            mouse_move_abs(bx, by);
+            std::thread::sleep(Duration::from_millis(120));
+            mouse_button(true);
+            std::thread::sleep(Duration::from_millis(120));
+            let t0 = std::time::Instant::now();
+            for i in 1..=40 {
+                mouse_move_abs(bx + 5 * i, by);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let inject_ms = t0.elapsed().as_millis();
+            let mut last_w = i32::MIN;
+            let mut last_change = std::time::Instant::now();
+            loop {
+                let w = frame_of(hwnd).map(|f| f[2] - f[0]).unwrap_or(-1);
+                if w != last_w {
+                    last_w = w;
+                    last_change = std::time::Instant::now();
+                }
+                if last_change.elapsed().as_millis() >= 120 || t0.elapsed().as_millis() > 8000 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let settle_ms = last_change.duration_since(t0).as_millis();
+            mouse_button(false);
+            println!(
+                "native-resize: w0={w0} w_final={last_w} expected≈{} 注入用时={inject_ms}ms 追上用时={settle_ms}ms",
+                w0 + 200
+            );
+            println!("NATIVE_RESIZE_DONE");
+        }
         "close" => {
             unsafe {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
