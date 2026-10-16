@@ -13,7 +13,7 @@
 //!   首次触碰（钩子线程启动阶段），热路径（push/drain）零分配。
 
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{LazyLock, RwLock};
 
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -37,8 +37,17 @@ pub static RING: LazyLock<Ring<EngineEvent, RING_SLOTS>> = LazyLock::new(Ring::n
 static ENGINE_TID: AtomicU32 = AtomicU32::new(0);
 /// LL 钩子句柄（`HHOOK` = 指针；回调 `CallNextHookEx` 用；未安装时为 null）。
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
-/// 配置的修饰键 VK 列表：`spawn` 时一次性拷贝（分配在启动阶段，回调只读）。
-static MODS_VKS: OnceLock<Vec<u16>> = OnceLock::new();
+/// 要监视的修饰键 VK 列表。用 `RwLock` 而非 `OnceLock`：设置界面热重载改了触发键
+/// 也必须能生效（写方 = 保存时调 `set_mods`，读方 = 钩子回调）。无竞争时读锁是
+/// 纳秒级、不分配、不阻塞，仍满足"回调 O(1)"约束。
+static MODS_VKS: RwLock<Vec<u16>> = RwLock::new(Vec::new());
+
+/// 更新要监视的修饰键（设置界面保存后调用；启动时 `spawn` 也会调一次）。
+pub fn set_mods(vks: &[u16]) {
+    if let Ok(mut w) = MODS_VKS.write() {
+        *w = vks.to_vec();
+    }
+}
 
 /// LL 钩子是否仍安装在位（callback 卡顿超 300ms 系统会自动移除，
 /// 故这是"无卡顿"的量化哨兵；T3.1 冒烟与 T4.2 验收用）。
@@ -54,7 +63,7 @@ pub fn is_installed() -> bool {
 /// （engine 线程由 T3.2 `engine_loop::run_in_thread` 创建，spawn 钩子线程时传入）。
 /// GOAL 原句按"spawn 使回调绑定到一个 engine_tid"解读，语义不变。
 pub fn spawn(engine_tid: u32, mods: &[u16]) -> std::thread::JoinHandle<()> {
-    MODS_VKS.get_or_init(|| mods.to_vec());
+    set_mods(mods);
     ENGINE_TID.store(engine_tid, Ordering::Release);
     std::thread::Builder::new()
         .name("anydrag-hook".into())
@@ -105,14 +114,12 @@ unsafe extern "system" fn ll_proc(nCode: i32, wParam: usize, lParam: isize) -> i
             let y = (*info).pt.y;
             // 组装按下的修饰键 mask：bit = VK & 0x1F（mods.rs 注记：左侧/右侧修饰键
             // 与基础码落不同 bit；MVP"配置哪个 VK 就检查哪个 bit"）。
-            let vks: &[u16] = match MODS_VKS.get() {
-                Some(v) => v,
-                None => &[],
-            };
             let mut mods = 0u32;
-            for &vk in vks.iter() {
-                if GetAsyncKeyState(vk as i32) as i32 & 0x8000 != 0 {
-                    mods |= 1u32 << (vk & 0x1F);
+            if let Ok(vks) = MODS_VKS.read() {
+                for &vk in vks.iter() {
+                    if GetAsyncKeyState(vk as i32) as i32 & 0x8000 != 0 {
+                        mods |= 1u32 << (vk & 0x1F);
+                    }
                 }
             }
             let ev = match msg {

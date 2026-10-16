@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, TranslateMessage, WM_APP,
 };
 
-use crate::config::{Config, ENABLED};
+use crate::config::{self, Config, ENABLED};
 use crate::engine::{Action, DragState, EngineCfg, EngineEvent};
 use crate::hook;
 use crate::winmod;
@@ -37,15 +37,8 @@ pub fn run_in_thread(cfg: Arc<Config>) -> u32 {
         .spawn(move || {
             let tid = unsafe { GetCurrentThreadId() };
             // 钩子线程必须绑定到 engine 线程（PostThreadMessage 目标）。
-            // E：读键 = modifiers ∪ resize_modifiers 去重并集——resize_mask 的
-            // 触发位（如 Ctrl bit17）若缺位，事件 mods 永远没有该 bit，resize 永不触发。
-            let mut vks: Vec<u16> = cfg.modifiers.clone();
-            for &vk in cfg.resize_modifiers.iter() {
-                if !vks.contains(&vk) {
-                    vks.push(vk);
-                }
-            }
-            hook::spawn(tid, &vks);
+            // 读键 = modifiers ∪ resize_modifiers（去重并集）——见 Config::all_vks。
+            hook::spawn(tid, &cfg.all_vks());
             tx.send(tid).ok();
             run(cfg);
         })
@@ -59,6 +52,10 @@ pub fn run_in_thread(cfg: Arc<Config>) -> u32 {
 /// engine 线程消息泵（`pub`：`run_in_thread` 的线程体；也供单测直接驱动）。
 pub fn run(cfg: Arc<Config>) {
     let mut state = DragState::Idle;
+    // 生效配置快照 + 版本号：设置界面保存后 `config::replace()` 会自增版本号，
+    // 这里检测到变化就刷新快照并同步钩子的监视键列表 —— 即"改完即时生效"。
+    let mut live: Config = (*cfg).clone();
+    let mut live_ver = config::version();
     let mut msg: _ = unsafe { core::mem::zeroed() };
     loop {
         let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
@@ -66,6 +63,13 @@ pub fn run(cfg: Arc<Config>) {
             break; // 0 = WM_QUIT；-1 = 错误——两种都退泵（进程随 main 退出，LL 钩子自动卸载）。
         }
         if msg.message == WM_APP {
+            // 热重载检查（无锁读一个原子；无变化时零开销）。
+            let v = config::version();
+            if v != live_ver {
+                live = config::snapshot();
+                live_ver = v;
+                hook::set_mods(&live.all_vks());
+            }
             // hook 每事件 Post 一条 WM_APP；一次 drain 吃干净（可能攒了多条）。
             let mut buf: [core::mem::MaybeUninit<EngineEvent>; hook::RING_SLOTS] =
                 unsafe { core::mem::zeroed() };
@@ -76,7 +80,7 @@ pub fn run(cfg: Arc<Config>) {
                 // enabled 开关读原子镜像（T3.3：托盘线程翻转，Arc<Config> 不可原地改）。
                 if ENABLED.load(Ordering::Acquire) {
                     for ev in &events {
-                        step(&mut state, ev, &cfg);
+                        step(&mut state, ev, &live);
                     }
                 } else if !matches!(state, DragState::Idle) {
                     // 运行中被 Disable：状态回 Idle（GOAL"feed 恒 None"的清理语义）。

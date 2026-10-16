@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetSystemMetrics, GetWindowPlacement, GetWindowTextW, IsWindowVisible,
     PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos, WindowFromPoint, GA_ROOT,
     HWND_NOTOPMOST, HWND_TOPMOST, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_MAXIMIZE, WINDOWPLACEMENT, WM_CLOSE,
+    SWP_NOSIZE, SW_MAXIMIZE, WINDOWPLACEMENT, WM_CLOSE, WM_COMMAND,
 };
 
 const VK_MENU: u16 = 0x12;
@@ -389,6 +389,16 @@ fn main() {
             let wa = work_area();
             println!("maximize: hwnd=0x{:x} after=[{f1:?}] work_area=[{wa:?}]", hwnd as isize);
             println!("MAXIMIZE=OK");
+        }
+        "send-save" => {
+            // 给设置窗口发一条 WM_COMMAND(ID_SAVE=1)，等价于点"保存"按钮。
+            // 用于自动化验证「设置界面保存 → config::replace 热重载 + 写盘」这条链路。
+            unsafe {
+                PostMessageW(hwnd, WM_COMMAND, 1, 0);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            println!("send-save: posted WM_COMMAND(ID_SAVE) to 0x{:x}", hwnd as isize);
+            println!("SEND_SAVE=OK");
         }
         "close" => {
             unsafe {

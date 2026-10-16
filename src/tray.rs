@@ -19,7 +19,7 @@
 //! `install(&cfg)` 在 main 线程跑托盘消息泵（阻塞至 Quit）。
 
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
 use windows_sys::core::PCWSTR;
@@ -30,15 +30,15 @@ use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetMessageW,
-    GetCursorPos, HMENU, IMAGE_ICON, IDI_APPLICATION, IDI_QUESTION, IDC_ARROW, LR_DEFAULTSIZE,
-    LR_SHARED, LoadCursorW, LoadImageW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING,
-    MessageBoxW, PostQuitMessage, RegisterClassExW, SetForegroundWindow, TPM_RIGHTALIGN,
-    TranslateMessage, WNDCLASSEXW, DispatchMessageW, HWND_MESSAGE, MSG,
-    TrackPopupMenu, WM_APP, WM_COMMAND, WM_LBUTTONUP, WM_RBUTTONUP, WS_POPUP,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    GetCursorPos, GetMessageW, HMENU, HWND_MESSAGE, IDC_ARROW, LoadCursorW, MB_ICONINFORMATION,
+    MB_OK, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostQuitMessage, RegisterClassExW,
+    SetForegroundWindow, TPM_RIGHTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
+    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_POPUP,
 };
 
 use crate::config;
+use crate::icon;
 
 /// 托盘回调消息（GOAL T3.3：`u32` 自定义 `WM_APP+100`）。
 const TRAY_MSG: u32 = WM_APP + 100;
@@ -47,8 +47,28 @@ const MENU_TOGGLE: usize = 1;
 const MENU_CONFIG: usize = 2;
 const MENU_QUIT: usize = 3;
 const MENU_USAGE: usize = 4;
+const MENU_SETTINGS: usize = 5;
 /// 托盘图标 uID。
 const TRAY_ICON_ID: u32 = 1;
+
+/// 当前托盘图标句柄 + 它是否是**自绘**的（自绘的要手动销毁；系统 `LR_SHARED`
+/// 兜底图标不能销毁）。切换启用态时先销毁旧的，避免每次切换泄漏一个 HICON。
+static PREV_ICON: AtomicIsize = AtomicIsize::new(0);
+static PREV_ICON_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// 取一个新的托盘图标（自绘优先，失败退回系统图标），并回收上一个自绘图标。
+fn next_icon(enabled: bool) -> *mut c_void {
+    let mut h = icon::tray_icon(enabled);
+    let owned = h != 0;
+    if !owned {
+        h = icon::fallback();
+    }
+    let prev = PREV_ICON.swap(h, Ordering::AcqRel);
+    if PREV_ICON_OWNED.swap(owned, Ordering::AcqRel) && prev != 0 {
+        icon::destroy(prev);
+    }
+    h as *mut c_void
+}
 
 /// NUL 结尾 wide 串（局部持有，FFI 调用期间有效）。
 fn wstr(s: &str) -> Vec<u16> {
@@ -97,19 +117,9 @@ pub fn install(cfg: &Arc<config::Config>) {
             eprintln!("anydrag-win: CreateWindowExW(HWND_MESSAGE) failed");
             return;
         }
-        // GOAL T3.3：图标 = LoadImageW(0, IDI_APPLICATION, …)，不内嵌资源文件。
-        // **hInstance 必须是 NULL**：IDI_APPLICATION 是系统预定义资源（MAKEINTRESOURCE(32512)），
-        // 传本进程模块句柄会从自己的 exe 里找图标资源 → 本仓没有 .rc/图标 → 返回 NULL →
-        // NIM_ADD 时 hIcon=NULL 的托盘图标**不可见**（2026-10-16 用户实测"托盘没图标"即此因；
-        // set_icon_state 一直用的就是 NULL，故只有启动路径中招）。
-        let icon = LoadImageW(
-            std::ptr::null_mut(),
-            IDI_APPLICATION,
-            IMAGE_ICON,
-            0,
-            0,
-            LR_DEFAULTSIZE | LR_SHARED,
-        );
+        // 图标 = **运行时自绘**（icon::tray_icon，四向移动箭头），不内嵌资源文件，
+        // 也不再借用系统默认的 IDI_APPLICATION（跟谁都撞脸、认不出是哪个工具）。
+        let icon = next_icon(true);
         let mut ni = NOTIFYICONDATAW::default();
         ni.cbSize = core::mem::size_of::<NOTIFYICONDATAW>() as u32;
         ni.hWnd = hwnd;
@@ -127,7 +137,7 @@ pub fn install(cfg: &Arc<config::Config>) {
         if std::env::var_os("ANYDRAG_DEBUG").is_some() {
             eprintln!("[tray] NIM_ADD ok, hIcon=0x{:x}", icon as usize);
         }
-        // 启动即反映启用状态（config.json enabled=false 启动时 = 黄手 + "已禁用" tip）。
+        // 启动即反映启用状态（config.json enabled=false 时直接是灰色"已禁用"图标）。
         if !config::ENABLED.load(Ordering::Acquire) {
             set_icon_state(hwnd, false);
         }
@@ -167,6 +177,7 @@ unsafe extern "system" fn wnd_proc(
                     let new = toggle_enabled();
                     set_icon_state(hwnd, new);
                 }
+                MENU_SETTINGS => crate::settings::open(),
                 MENU_USAGE => {
                     let p = config::file_path().display().to_string();
                     let text = wstr(&format!(
@@ -174,8 +185,13 @@ unsafe extern "system" fn wnd_proc(
                          按住 Alt：\n\
                          · 按住鼠标左键拖动 → 移动当前窗口（不限于标题栏，点哪儿拖哪儿）\n\
                          · 双击（约 0.5 秒内两次、几乎不位移）→ 窗口最大化；已最大化时再双击 → 还原\n\n\
+                         按住 Alt + Ctrl：\n\
+                         · 在窗口任意位置拖动 → 调整窗口大小（方向自动判定，不用瞄边缘）\n\n\
+                         按住鼠标中键：\n\
+                         · 朝某个方向拖拽后松开 → 窗口吸附到该方向的半屏 / 四分之一屏\n\n\
+                         更详细的选项（触发键、阈值、排除名单、中键分屏开关）见托盘菜单「设置…」。\n\
                          配置文件：{p}\n\
-                         修改后重启 anydrag-win 生效（本菜单「启用/禁用」可即时切换）。",
+                         修改后重启 anydrag-win 生效（「启用/禁用」与「设置…」即时生效）。",
                     ));
                     let cap = wstr("anydrag-win");
                     MessageBoxW(hwnd, text.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
@@ -200,10 +216,12 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
     unsafe {
         let toggle = wstr(if enabled { "禁用" } else { "启用" });
         let usage_lbl = wstr("用法…");
+        let settings_lbl = wstr("设置…");
         let config_lbl = wstr("配置文件…");
         let quit_lbl = wstr("退出");
         AppendMenuW(hmenu, MF_STRING, MENU_TOGGLE, toggle.as_ptr());
         AppendMenuW(hmenu, MF_SEPARATOR, 0, 0 as PCWSTR);
+        AppendMenuW(hmenu, MF_STRING, MENU_SETTINGS, settings_lbl.as_ptr());
         AppendMenuW(hmenu, MF_STRING, MENU_USAGE, usage_lbl.as_ptr());
         AppendMenuW(hmenu, MF_STRING, MENU_CONFIG, config_lbl.as_ptr());
         AppendMenuW(hmenu, MF_STRING, MENU_QUIT, quit_lbl.as_ptr());
@@ -234,20 +252,15 @@ fn toggle_enabled() -> bool {
 }
 
 /// 图标 + tip 反映启用状态（`NIM_MODIFY`，同 uID/uCallbackMessage）：
-/// 启用 = IDI_APPLICATION + "anydrag-win"；禁用 = IDI_QUESTION + "anydrag-win（已禁用）"。
+/// 启用 = **自绘四向移动箭头（亮蓝）** + "anydrag-win"；
+/// 禁用 = **同一箭头（灰）** + "anydrag-win（已禁用）"。
+///
+/// 为什么改成自绘：原先借用系统图标（`IDI_APPLICATION` / `IDI_QUESTION`），
+/// 前者是个通用窗口图标、跟一堆程序撞脸，用户反馈"还是这个默认的图标"认不出来。
+/// 自绘的箭头直接表达"拖窗口"，且配色即状态，托盘上一眼可辨。
 fn set_icon_state(hwnd: HWND, enabled: bool) {
     unsafe {
-        // IDI_* 在 windows-sys 是 PCWSTR（系统图标名句柄），LoadImageW 的 pName 参数。
-        // hInstance 传 NULL = 从 system32 取系统图标（GOAL T3.3 的 LoadImageW(0, …) 语义）。
-        // 禁用态用 IDI_QUESTION（蓝圈问号 = "暂停中"）：本版本 windows-sys 无
-        // IDI_OUTLAW（禁止圈）；而 IDI_HAND 与 IDI_ERROR 同为 32513，Win11 下
-        // 即红圈白叉——16px 托盘上被用户误读为"出错"（2026-10-16 反馈
-        // "托盘图标怎么是个 X"，根因即此）。
-        let icon = if enabled {
-            LoadImageW(std::ptr::null_mut(), IDI_APPLICATION, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED)
-        } else {
-            LoadImageW(std::ptr::null_mut(), IDI_QUESTION, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED)
-        };
+        let icon = next_icon(enabled);
         let tip = if enabled {
             wstr("anydrag-win")
         } else {

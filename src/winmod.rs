@@ -177,6 +177,13 @@ pub fn resolve_target(x: i32, y: i32, cfg: &Config) -> Option<Target> {
                 }
                 continue;
             };
+            // 本工具自己的窗口（设置界面等）不参与手势：对它做拖动/缩放没有意义。
+            if exe == "anydrag-win.exe" {
+                if dbg {
+                    eprintln!("[resolve] ({x},{y}) 0x{:x} skip: own window", hwnd as usize);
+                }
+                continue;
+            }
             // 排除表：完全无视手势（不穿透到下层窗口，GOAL 语义）。
             if cfg.native_excluded.iter().any(|n| n == &exe) {
                 if dbg {

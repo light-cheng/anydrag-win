@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 /// 触发修饰键默认值：VK_MENU (Alt) = 0x12。
 pub const DEFAULT_MODS: [u16; 1] = [0x12];
@@ -21,6 +22,44 @@ pub const DEFAULT_RESIZE_MODS: [u16; 2] = [0x11, 0x12];
 /// 改（共享引用 UB），故开关走原子镜像；磁盘持久化仍由 `Config::save()` 承担。
 /// main 启动时按 `Config::load()` 初始化。
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 当前生效配置的全局存放点（2026-10-16 设置界面引入，用于**热重载**）。
+///
+/// 为什么需要它：engine 线程持的是 `Arc<Config>`（不可变），设置界面保存的新值
+/// 没法"塞回去"。改用一个全局 `RwLock<Config>` + 版本号：
+/// 写方（设置界面）`replace()` 后版本号 +1；读方（engine 线程）每个事件批次
+/// 比一次版本号，变了才 clone 一份新快照 —— 热路径上没有锁竞争、也不做无谓克隆。
+static STORE: OnceLock<RwLock<Config>> = OnceLock::new();
+static VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// 启动时装入初始配置（main 调用一次）。
+pub fn init(cfg: Config) {
+    let _ = STORE.set(RwLock::new(cfg));
+}
+
+/// 配置版本号：每次 `replace()` 自增。engine 线程用它判断是否需要刷新快照。
+pub fn version() -> u64 {
+    VERSION.load(Ordering::Acquire)
+}
+
+/// 取当前配置的快照（未 `init` 时返回默认值，保证任何调用顺序都不 panic）。
+pub fn snapshot() -> Config {
+    match STORE.get() {
+        Some(lock) => lock.read().map(|c| c.clone()).unwrap_or_default(),
+        None => Config::default(),
+    }
+}
+
+/// 用新配置替换当前生效值（热重载），并自增版本号唤醒读方。
+/// **不写盘**——写盘由调用方显式 `Config::save()`（设置界面保存按钮负责）。
+pub fn replace(cfg: Config) {
+    if let Some(lock) = STORE.get() {
+        if let Ok(mut w) = lock.write() {
+            *w = cfg;
+        }
+    }
+    VERSION.fetch_add(1, Ordering::Release);
+}
 
 /// 默认拖动策略。T2.3 spike（2026-10-15）实测定稿："fallback"——
 /// 远程 0xF012 在 explorer 上生效（B 按键变体 dx=160）但 notepad 失效，
@@ -114,6 +153,18 @@ impl Config {
         mask_of(&self.resize_modifiers)
     }
 
+    /// 钩子线程需要监视的全部 VK：拖动触发键 ∪ 缩放触发键（去重）。
+    /// 设置界面热重载后要用它更新 `hook::set_mods`——否则改了触发键也不生效。
+    pub fn all_vks(&self) -> Vec<u16> {
+        let mut v = self.modifiers.clone();
+        for &vk in self.resize_modifiers.iter() {
+            if !v.contains(&vk) {
+                v.push(vk);
+            }
+        }
+        v
+    }
+
     /// 原子写：先写同目录 `.json.tmp` 再 rename——避免托盘写回时半截文件毁掉配置。
     pub fn save(&self) {
         if let Err(e) = save_to(self, &config_path()) {
@@ -205,5 +256,23 @@ mod tests {
         let c = load_from(&path);
         assert_eq!(c, Config::default(), "corrupt file must yield defaults, not panic");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_store_hot_reload_roundtrip() {
+        // 设置界面"保存即生效"的机制：replace() 换值 + 版本号自增；
+        // engine 线程靠版本号决定是否刷新快照（见 engine_loop::run 的热重载检查）。
+        // 放在同一个测试里做，避免与其他用例并发争抢全局存放点。
+        init(Config::default());
+        let v0 = version();
+        let mut c = Config::default();
+        c.drag_threshold_px = 77;
+        replace(c);
+        assert!(version() > v0, "replace must bump the version so readers notice");
+        assert_eq!(
+            snapshot().drag_threshold_px,
+            77,
+            "snapshot must observe the replaced value"
+        );
     }
 }
