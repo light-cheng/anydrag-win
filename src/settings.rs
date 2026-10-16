@@ -17,17 +17,19 @@ use std::sync::Mutex;
 
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetStockObject, SetTextColor, DEFAULT_GUI_FONT, HDC, NULL_BRUSH,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowTextLengthW, GetWindowTextW,
     IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowTextW,
-    ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
-    CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_WANTRETURN, IDC_ARROW, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFONT,
-    WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_VISIBLE, WS_VSCROLL,
+    ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX,
+    BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, IDC_ARROW, SW_SHOW, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config;
@@ -35,11 +37,19 @@ use crate::config;
 /// 复选框勾选值（windows-sys 0.61 只导出了 BST_FOCUS/BST_PUSHED，勾选态自己定义）。
 const BST_CHECKED_V: usize = 1;
 
+/// COLORREF = 0x00BBGGRR（RGB 宏未由 windows-sys 导出，等价手写）。
+fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
 const ID_SAVE: usize = 1;
 const ID_CANCEL: usize = 2;
 
 /// 设置窗口句柄（0 = 未打开）。只允许一个实例。
 static WIN: AtomicIsize = AtomicIsize::new(0);
+
+/// 底部灰色提示控件句柄（WM_CTLCOLORSTATIC 里给它上灰色文字）。
+static HINT_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// 控件句柄表。`HWND` 是裸指针（非 `Send`），放不进 `static Mutex`，故统一存 `isize`。
 #[derive(Clone, Copy)]
@@ -96,6 +106,14 @@ pub fn open() {
         }
         let instance = GetModuleHandleW(0 as PCWSTR);
         let class = wstr("anydrag-win-settings");
+        // 窗口图标 = 运行时自绘的四向箭头（与托盘同源，启用=亮蓝）。
+        // 类注册的图标句柄随进程退出由系统回收，无需手动销毁。
+        let icon = crate::icon::tray_icon(true);
+        let hicon = if icon != 0 {
+            icon as *mut c_void
+        } else {
+            std::ptr::null_mut()
+        };
         let cls = WNDCLASSEXW {
             cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
             style: 0,
@@ -103,12 +121,12 @@ pub fn open() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: std::ptr::null_mut(),
+            hIcon: hicon,
             hCursor: LoadCursorW(instance, IDC_ARROW),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: 0 as PCWSTR,
             lpszClassName: class.as_ptr(),
-            hIconSm: std::ptr::null_mut(),
+            hIconSm: hicon,
         };
         // 重复注册会返回 0 且 GetLastError=ERROR_CLASS_ALREADY_EXISTS(1410)，属正常。
         if RegisterClassExW(&cls) == 0 && GetLastError() != 1410 {
@@ -124,8 +142,8 @@ pub fn open() {
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            s(580),
-            s(566),
+            s(620),
+            s(660),
             0 as HWND,
             0 as _,
             instance,
@@ -171,13 +189,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_DESTROY => {
             WIN.store(0, Ordering::Release);
+            HINT_HWND.store(0, Ordering::Release);
             0
+        }
+        // 底部提示文字上灰色（控件创建时把句柄存进 HINT_HWND）；
+        // 其余 STATIC 保持默认（透明背景 + 黑字）。
+        WM_CTLCOLORSTATIC => {
+            if lp as HWND == HINT_HWND.load(Ordering::Acquire) as HWND {
+                SetTextColor(wp as HDC, rgb(0x5A, 0x5A, 0x5A));
+                return GetStockObject(NULL_BRUSH) as isize;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
 /// 建控件（WM_CREATE）。坐标单位是物理像素，已按 DPI 缩放。
+///
+/// **布局（2026-10-16 美化）**：三个分组框（触发键 / 手势参数 / 进程名单）+ 底部按钮区。
+/// 之前所有控件平铺无层次，用户反馈"gui 需要美化"。分组框只画框和标题（BS_GROUPBOX），
+/// 子控件仍是 sibling 用绝对坐标摆放；输入框加 WS_EX_CLIENTEDGE 立体边框；
+/// 「保存」设为默认按钮（BS_DEFPUSHBUTTON，回车可触发）。
 unsafe fn create_controls(parent: HWND) {
     let dpi = GetDpiForSystem().max(96) as i32;
     let s = |v: i32| v * dpi / 96;
@@ -186,6 +219,7 @@ unsafe fn create_controls(parent: HWND) {
     let mk = |class: &str,
               text: &str,
               style: u32,
+              ex: u32,
               x: i32,
               y: i32,
               w: i32,
@@ -195,7 +229,7 @@ unsafe fn create_controls(parent: HWND) {
         let c = wstr(class);
         let t = wstr(text);
         let hw = CreateWindowExW(
-            0,
+            ex,
             c.as_ptr(),
             t.as_ptr(),
             WS_CHILD | WS_VISIBLE | style,
@@ -215,85 +249,98 @@ unsafe fn create_controls(parent: HWND) {
         hw as isize
     };
     let label = |text: &str, x: i32, y: i32, w: i32| -> isize {
-        mk("STATIC", text, 0, x, y, w, 18, 0)
+        mk("STATIC", text, 0, 0, x, y, w, 20, 0)
     };
-    let check = |text: &str, x: i32, y: i32, w: i32, id: usize| -> isize {
-        mk("BUTTON", text, BS_AUTOCHECKBOX as u32, x, y, w, 20, id)
+    let check = |text: &str, x: i32, y: i32, w: i32| -> isize {
+        mk("BUTTON", text, BS_AUTOCHECKBOX as u32, 0, x, y, w, 24, 0)
     };
-    let edit = |text: &str, x: i32, y: i32, w: i32, h: i32, id: usize| -> isize {
-        mk("EDIT", text, WS_BORDER | ES_AUTOHSCROLL as u32, x, y, w, h, id)
+    // 单行输入框（立体边框）。
+    let edit1 = |x: i32, y: i32, w: i32| -> isize {
+        mk(
+            "EDIT",
+            "",
+            ES_AUTOHSCROLL as u32,
+            WS_EX_CLIENTEDGE,
+            x,
+            y,
+            w,
+            26,
+            0,
+        )
+    };
+    // 多行输入框（立体边框 + 滚动条）。
+    let editn = |x: i32, y: i32, w: i32, h: i32| -> isize {
+        mk(
+            "EDIT",
+            "",
+            WS_VSCROLL
+                | ES_MULTILINE as u32
+                | ES_AUTOVSCROLL as u32
+                | ES_WANTRETURN as u32,
+            WS_EX_CLIENTEDGE,
+            x,
+            y,
+            w,
+            h,
+            0,
+        )
+    };
+    let group = |title: &str, x: i32, y: i32, w: i32, h: i32| {
+        mk("BUTTON", title, BS_GROUPBOX as u32, 0, x, y, w, h, 0);
     };
 
     let mut c = ZERO;
-    // 拖动/双击触发键
-    label("触发键：拖动 / 双击", 16, 16, 200);
-    c.drag_alt = check("Alt", 220, 14, 60, 0);
-    c.drag_ctrl = check("Ctrl", 285, 14, 60, 0);
-    c.drag_shift = check("Shift", 350, 14, 64, 0);
-    c.drag_win = check("Win", 420, 14, 60, 0);
-    // 缩放触发键
-    label("触发键：缩放", 16, 48, 200);
-    c.rz_alt = check("Alt", 220, 46, 60, 0);
-    c.rz_ctrl = check("Ctrl", 285, 46, 60, 0);
-    c.rz_shift = check("Shift", 350, 46, 64, 0);
-    c.rz_win = check("Win", 420, 46, 60, 0);
-    // 阈值 / 双击间隔
-    label("拖动阈值（像素）", 16, 84, 200);
-    c.thr = edit("", 220, 82, 80, 22, 0);
-    label("双击间隔（毫秒，留空=跟随系统）", 16, 116, 300);
-    c.dbl = edit("", 320, 114, 80, 22, 0);
-    // 中键分屏
-    label("中键方向分屏", 16, 152, 200);
-    c.mid_on = check("启用", 220, 150, 70, 0);
-    label("判定阈值(px)", 300, 152, 90);
-    c.mid_thr = edit("", 395, 150, 70, 22, 0);
-    // 默认策略
-    label("默认拖动通道", 16, 186, 200);
+
+    // ── 分组一：触发键 ──────────────────────────────
+    group("触发键", 12, 12, 596, 104);
+    label("拖动 / 双击：", 30, 42, 110);
+    c.drag_alt = check("Alt", 150, 40, 64);
+    c.drag_ctrl = check("Ctrl", 218, 40, 64);
+    c.drag_shift = check("Shift", 290, 40, 68);
+    c.drag_win = check("Win", 362, 40, 64);
+    label("缩放：", 30, 80, 110);
+    c.rz_alt = check("Alt", 150, 78, 64);
+    c.rz_ctrl = check("Ctrl", 218, 78, 64);
+    c.rz_shift = check("Shift", 290, 78, 68);
+    c.rz_win = check("Win", 362, 78, 64);
+
+    // ── 分组二：手势参数 ────────────────────────────
+    group("手势参数", 12, 128, 596, 188);
+    label("拖动阈值（像素）", 30, 160, 200);
+    c.thr = edit1(240, 158, 90);
+    label("双击间隔（毫秒，留空 = 跟随系统）", 30, 198, 280);
+    c.dbl = edit1(320, 196, 90);
+    label("中键方向分屏", 30, 236, 130);
+    c.mid_on = check("启用", 168, 234, 76);
+    label("判定阈值(px)", 260, 236, 110);
+    c.mid_thr = edit1(378, 234, 90);
+    label("默认拖动通道", 30, 274, 130);
     c.strategy = mk(
         "COMBOBOX",
         "",
         CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+        0,
+        168,
+        272,
+        260,
         220,
-        184,
-        160,
-        200,
         0,
     );
-    // 名单
-    label("完全无视手势的进程（一行一个，小写）", 16, 226, 400);
-    c.excl = mk(
-        "EDIT",
-        "",
-        WS_BORDER
-            | WS_VSCROLL
-            | ES_MULTILINE as u32
-            | ES_AUTOVSCROLL as u32
-            | ES_WANTRETURN as u32,
-        16,
-        248,
-        530,
-        96,
-        0,
+
+    // ── 分组三：进程名单（一行一个，小写）────────────
+    group("进程名单（一行一个，小写）", 12, 328, 596, 256);
+    label("完全无视手势的进程：", 30, 358, 300);
+    c.excl = editn(30, 384, 560, 76);
+    label("强制走 fallback 通道的进程：", 30, 476, 300);
+    c.fallback = editn(30, 502, 560, 76);
+
+    // ── 底部按钮区 ──────────────────────────────────
+    HINT_HWND.store(
+        label("保存后立即生效，无需重启。", 16, 606, 300),
+        Ordering::Release,
     );
-    label("强制走 fallback 通道的进程（一行一个，小写）", 16, 354, 420);
-    c.fallback = mk(
-        "EDIT",
-        "",
-        WS_BORDER
-            | WS_VSCROLL
-            | ES_MULTILINE as u32
-            | ES_AUTOVSCROLL as u32
-            | ES_WANTRETURN as u32,
-        16,
-        376,
-        530,
-        96,
-        0,
-    );
-    // 按钮 + 提示
-    mk("BUTTON", "保存", BS_PUSHBUTTON as u32, 340, 492, 96, 30, ID_SAVE);
-    mk("BUTTON", "取消", BS_PUSHBUTTON as u32, 450, 492, 96, 30, ID_CANCEL);
-    label("保存后立即生效，无需重启。", 16, 498, 300);
+    mk("BUTTON", "保存", BS_DEFPUSHBUTTON as u32, 0, 330, 602, 110, 34, ID_SAVE);
+    mk("BUTTON", "取消", BS_PUSHBUTTON as u32, 0, 452, 602, 110, 34, ID_CANCEL);
 
     *CTL.lock().unwrap() = c;
 
