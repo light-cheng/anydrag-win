@@ -84,6 +84,7 @@ pub fn run(cfg: Arc<Config>) {
 }
 
 /// 单事件一步：feed + 执行动作（`&cfg` 现取现算快照）。
+/// `ANYDRAG_DEBUG=1` 时向 stderr 打印每事件动作（冒烟/验收诊断用，默认静默）。
 fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     // 动作执行需要的目标 hwnd：feed 会改状态（如双击 Armed→Idle），故**先**快照。
     let pre_hwnd: Option<isize> = match state {
@@ -99,6 +100,16 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     };
     let resolve = |x: i32, y: i32| winmod::resolve_target(x, y, cfg);
     let actions = state.feed(ev, &resolve, &ecfg);
+
+    if std::env::var_os("ANYDRAG_DEBUG").is_some() {
+        eprintln!(
+            "[engine] {:?} → {:?} (pre_hwnd={:?}, exe-target={})",
+            ev,
+            actions,
+            pre_hwnd,
+            pre_hwnd.map(|h| winmod::exe_name(h).unwrap_or_default()).unwrap_or_default()
+        );
+    }
 
     // 合并：同一事件内多条 SetPos 只执行最后一条（GOAL T3.2 执行规则）。
     let mut last_setpos: Option<(i32, i32)> = None;
@@ -122,8 +133,11 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
                 }
             }
             Action::End => {
-                // 状态回 Idle（feed 的双击/收尾路径通常已置 Idle；幂等兜底清理）。
-                *state = DragState::Idle;
+                // End 是"相位结束"通知：feed 已把正确的下一状态提交进 `state`
+                // （Up 后保留 Armed = 双击记忆 / 双击后 Idle / 提交后 Native），
+                // 执行器**不得**在此重置——否则 Up[End] 会抹掉双击记忆，
+                // Down/Up/Down 生产手势永远判不出双击（2026-10-15 冒烟实测：
+                // 四个 Down 全 [None]，窗口纹丝不动，根因即此）。
             }
         }
     }

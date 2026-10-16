@@ -1,0 +1,262 @@
+//! 临时 T3.4 冒烟驱动（GOAL T3.4 手动冒烟项 2/3/4/5 的自动化替代；跑完即删）。
+//!
+//! 模拟"用户"：在目标窗口客户区做 Alt+拖 / Alt+双击（SendInput），
+//! DWM 几何前后差判定窗口是否跟手。被测对象是**运行中的 anydrag-win.exe**。
+//! 子命令：
+//!   frame <title-substr>     打印 DWM 几何 + 主屏工作区
+//!   alt-drag <title-substr>  Alt 按住 + 客户区中心左键拖 +80px（分段 4 步）
+//!   alt-dbl <title-substr>   Alt 双击（两次点按无位移，120ms 间隔）
+
+use std::time::Duration;
+
+use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
+use windows_sys::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, SendInput,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetSystemMetrics, GetWindowTextW, IsWindowVisible, PostMessageW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, WM_CLOSE,
+};
+
+const VK_MENU: u16 = 0x12;
+const DRAG_PX: i32 = 80;
+
+fn frame_of(hwnd: HWND) -> Option<[i32; 4]> {
+    unsafe {
+        let mut r: RECT = std::mem::zeroed();
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+            &mut r as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        ) == 0
+        {
+            Some([r.left, r.top, r.right, r.bottom])
+        } else {
+            None
+        }
+    }
+}
+
+fn work_area() -> [i32; 4] {
+    unsafe {
+        let mon = MonitorFromWindow(0 as HWND, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(mon, &mut mi);
+        [
+            mi.rcWork.left,
+            mi.rcWork.top,
+            mi.rcWork.right,
+            mi.rcWork.bottom,
+        ]
+    }
+}
+
+/// 四坐标均在 ±2px 内（与 winmod::is_maximized_simplified 同容差：Win11 DWM
+/// 最大化帧有 1px 取整偏差，严格 == 不可用）。
+fn within2(a: &[i32; 4], b: &[i32; 4]) -> bool {
+    [0, 1, 2, 3].iter().all(|&i| (a[i] - b[i]).abs() <= 2)
+}
+
+/// 标题包含（忽略大小写）的顶层窗口（取最后一个命中，覆盖多个同名窗口）。
+fn find_window(sub: &str) -> Option<HWND> {
+    use std::cell::RefCell;
+    // 泄漏到堆上拿到 &'static RefCell，回调 lparam 直接指向它（类型不混淆）。
+    let state: &'static RefCell<(String, isize)> =
+        Box::leak(Box::new(RefCell::new((sub.to_ascii_lowercase(), 0))));
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: isize) -> i32 {
+        let st = lparam as *const RefCell<(String, isize)>;
+        // 过滤：Win11 打包应用（如 notepad）名下有不可见的宿主顶层窗（1px 帧）。
+        // 只认"可见 + DWM 帧 > 100px"的真实窗口，否则测到隐形宿主窗（dx 恒 0）。
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let f = frame_of(hwnd);
+        let Some(fb) = f else { return 1 };
+        if (fb[2] - fb[0]) < 100 || (fb[3] - fb[1]) < 100 {
+            return 1; // 帧过小 = 宿主/消息窗
+        }
+        let mut t = [0u16; 512];
+        let n = GetWindowTextW(hwnd, t.as_mut_ptr(), 512);
+        if n > 0 {
+            let title: String = String::from_utf16_lossy(&t[..n as usize]);
+            let want = (*st).borrow().0.clone();
+            if title.to_ascii_lowercase().contains(&want) {
+                (*st).borrow_mut().1 = hwnd as isize;
+            }
+        }
+        1 // TRUE：继续枚举
+    }
+    unsafe {
+        let _ = EnumWindows(Some(cb), state as *const _ as isize);
+    }
+    let v = state.borrow().1;
+    (v != 0).then(|| v as HWND)
+}
+
+fn mouse_move_abs(x: i32, y: i32) {
+    unsafe {
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
+        let nx = (x as u32) * 65535 / (vw as u32 - 1);
+        let ny = (y as u32) * 65535 / (vh as u32 - 1);
+        mouse_input(nx as i32, ny as i32, MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE, 0);
+    }
+}
+
+fn mouse_button(down: bool) {
+    let flags = if down {
+        MOUSEEVENTF_LEFTDOWN
+    } else {
+        MOUSEEVENTF_LEFTUP
+    };
+    unsafe {
+        mouse_input(0, 0, flags, 0);
+    }
+}
+
+unsafe fn mouse_input(dx: i32, dy: i32, flags: u32, vk: u16) {
+    let inp = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    SendInput(1, &inp as *const INPUT as *const _, std::mem::size_of::<INPUT>() as i32);
+    let _ = vk;
+}
+
+fn key_event(vk: u16, up: bool) {
+    unsafe {
+        let inp = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: windows_sys::Win32::UI::Input::KeyboardAndMouse::KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        SendInput(1, &inp as *const INPUT as *const _, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn main() {
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    let Some(hwnd) = find_window(sub) else {
+        eprintln!("window not found: {sub}");
+        std::process::exit(2);
+    };
+    let f0 = frame_of(hwnd).expect("dwm frame");
+    match cmd {
+        "frame" => {
+            let wa = work_area();
+            println!(
+                "hwnd=0x{:x} frame=[{}, {}, {}, {}] work_area=[{}, {}, {}, {}]",
+                hwnd as isize, f0[0], f0[1], f0[2], f0[3], wa[0], wa[1], wa[2], wa[3]
+            );
+        }
+        "alt-drag" => {
+            let cx = (f0[0] + f0[2]) / 2;
+            let cy = f0[1] + 40; // 客户区（标题栏 ~32-39px，+40 落在客户区）
+            key_event(VK_MENU, false);
+            mouse_move_abs(cx, cy);
+            std::thread::sleep(Duration::from_millis(80));
+            mouse_button(true); // 引擎：Down(mods=Alt) → Armed
+            std::thread::sleep(Duration::from_millis(60));
+            for i in 1..=4 {
+                mouse_move_abs(cx + DRAG_PX * i / 4, cy); // 每 Move → Fallback SetPos（引擎合并）
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            mouse_button(false);
+            key_event(VK_MENU, true);
+            std::thread::sleep(Duration::from_millis(300));
+            let f1 = frame_of(hwnd).expect("dwm frame");
+            let dx = f1[0] - f0[0];
+            let dy = f1[1] - f0[1];
+            println!("alt-drag: dx={dx} dy={dy} (cmd +{DRAG_PX}px)");
+            println!("ALT_DRAG={}", if dx.abs() >= 40 { "PASS" } else { "FAIL" });
+        }
+        "alt-dbl" => {
+            // 客户端区中心点击（**避开标题栏**：Alt+双击标题栏 是 OS 自带"关闭窗
+            // 口"快捷键，会先于引擎手势关掉窗口——2026-10-15 实测，notepad 因此
+            // 被 OS 关闭、引擎 SC_MAXIMIZE 落空）。
+            let cx = (f0[0] + f0[2]) / 2;
+            let cy = (f0[1] + f0[3]) / 2;
+            for _ in 0..2 {
+                key_event(VK_MENU, false);
+                mouse_move_abs(cx, cy);
+                std::thread::sleep(Duration::from_millis(60));
+                mouse_button(true);
+                std::thread::sleep(Duration::from_millis(40));
+                mouse_button(false);
+                key_event(VK_MENU, true);
+                std::thread::sleep(Duration::from_millis(120)); // < GetDoubleClickTime
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let f1 = frame_of(hwnd).expect("dwm frame after dbl#1");
+            let wa = work_area();
+            let maximized = within2(&f1, &wa);
+            // 第二次双击（最大化窗中心仍是客户端点）→ 引擎应发 Restore。
+            let cx2 = (f1[0] + f1[2]) / 2;
+            let cy2 = (f1[1] + f1[3]) / 2;
+            for _ in 0..2 {
+                key_event(VK_MENU, false);
+                mouse_move_abs(cx2, cy2);
+                std::thread::sleep(Duration::from_millis(60));
+                mouse_button(true);
+                std::thread::sleep(Duration::from_millis(40));
+                mouse_button(false);
+                key_event(VK_MENU, true);
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let f2 = frame_of(hwnd).expect("dwm frame after dbl#2");
+            let restored = within2(&f2, &f0);
+            println!(
+                "alt-dbl: before=[{f0:?}] after_dbl1=[{f1:?}] after_dbl2=[{f2:?}] work_area=[{wa:?}]"
+            );
+            println!(
+                "ALT_DBL={} (maximized={maximized}, restored={restored})",
+                if maximized && restored { "PASS" } else { "FAIL" }
+            );
+        }
+        "close" => {
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let still = frame_of(hwnd).is_some();
+            println!("close: hwnd=0x{:x} still_present={still}", hwnd as isize);
+            println!("CLOSE=OK");
+        }
+        _ => {
+            eprintln!("unknown cmd {cmd}");
+            std::process::exit(1);
+        }
+    }
+}
