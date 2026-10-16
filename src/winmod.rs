@@ -23,19 +23,35 @@ use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, PostMessageW, SetWindowPos, GWL_EXSTYLE, SWP_NOSIZE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_FRAMECHANGED, WM_SYSCOMMAND, WS_EX_TOOLWINDOW,
+    EnumWindows, GetClassNameW, GetWindowLongW, GetWindowPlacement, GetWindowRect,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW,
+    SetWindowPlacement, SetWindowPos, GWL_EXSTYLE, SMTO_NORMAL, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SW_MAXIMIZE, SW_RESTORE, WM_SYSCOMMAND,
+    WINDOWPLACEMENT, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 // ---- 未文档化但数十年稳定的 syscommand 常量（GOAL §3：0xF012 由 T2.3 spike 背书）----
 pub const SC_DRAGMOVE: u32 = 0xF012; // SC_MOVE | HTCAPTION：让目标应用自己跑 caption 拖动循环
-pub const SC_MAXIMIZE: u32 = 0xF030;
-pub const SC_RESTORE: u32 = 0xF120;
-/// wParam 0x0001（HTCAPTION 族）：先于 SetWindowPos 发给目标，
-/// 让终端类应用 reflow。开放问题（GOAL §9b）：AltSnap 传 0 亦工作，MVP 按 GOAL 传 0x0001 并注释。
-pub const WM_SIZING: u32 = 0x0231;
+// SC_MAXIMIZE / SC_RESTORE 已删除：最大化/还原改用 SetWindowPlacement
+// （set_placement_max_restore），不再经目标应用的消息泵，见该函数注释。
+
+/// 尺寸调整相位通知（AltSnap `hooks.c:580-591` 的 `NotifySizeMoveStaEnd` 手法）：
+/// 拖拽开始/结束各 Post 一条，让目标应用进入"尺寸调整模式"、把重排推迟到结束时
+/// 一次性做——这是缩放/移动顺滑的关键配套，浏览器、终端、编辑器都依赖它。
+///
+/// **常量勘误（2026-10-16）**：此前这里把 `0x0231` 标成了 `WM_SIZING`，而
+/// `WM_SIZING` 真值是 `0x0214`，`0x0231` 是 **`WM_ENTERSIZEMOVE`**。后果是缩放路径
+/// **每一帧都发一条假的 ENTERSIZEMOVE（wParam=0x0001、lParam=本进程栈指针）却从不发
+/// EXITSIZEMOVE**，应用被永久卡在尺寸调整态 → 全部重排被无限推迟 → 这就是
+/// "缩放有很严重的延迟"的直接元凶。常量值已按 windows-sys 0.61.2 源码核对。
+pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
+pub const WM_EXITSIZEMOVE: u32 = 0x0232;
+/// 强制重绘同步（异步 SetWindowPos 后补发，见 `sync_paint`）。
+pub const WM_SYNCPAINT: u32 = 0x0088;
 
 /// 必须是进程**第一个** FFI 调用（GOAL 不变量 1）：
 /// 之后所有坐标（钩子/窗口框/绘制）统一物理像素。
@@ -231,23 +247,115 @@ unsafe fn is_maximized_simplified(hwnd: HWND, frame: &[i32; 4]) -> bool {
         && d(frame[3], mi.rcWork.bottom)
 }
 
-/// 发 syscommand（Maximize/Restore/BeginNativeDrag 共用通道）。
-/// PostMessage 跨进程投递：SC_MAXIMIZE/SC_RESTORE 是标准命令，目标 WndProc
-/// 正常处理；SC_DRAGMOVE 的跨进程生效性由 T2.3 spike 实测背书。
+/// 发 syscommand（现在只有 `BeginNativeDrag` 用它发 SC_DRAGMOVE）。
+/// PostMessage 跨进程投递 SC_DRAGMOVE 的生效性由 T2.3 spike 实测背书。
+///
+/// 最大化/还原**已不再走这里**——见 `set_placement_max_restore`。
 pub fn post_sys_command(hwnd: isize, cmd: u32) {
     unsafe {
         PostMessageW(hwnd as *mut c_void, WM_SYSCOMMAND, cmd as usize, 0);
     }
 }
 
-/// T2.2 回退执行器：hwnd 有效性守卫 + WM_SIZING(ALT 标记) + SetWindowPos 保持大小。
+/// 最大化 / 还原：用 `SetWindowPlacement`（AltSnap `MaximizeRestore_atpt` 的做法，
+/// `hooks.c:1287-1319`），**完全不依赖目标应用的消息泵**。
+///
+/// 为什么不再用 `PostMessage(WM_SYSCOMMAND, SC_MAXIMIZE)`：当 Alt 泄漏给目标应用、
+/// 应用进入菜单模式时，它的消息泵处在模态状态，投递的 WM_SYSCOMMAND 会被吞掉或无限
+/// 期延后——这正是 2026-10-16 用户实测的"Alt 双击根本无法最大化、只弹出菜单栏快捷键
+/// 提示"。`SetWindowPlacement` 由窗口管理器直接处理，与应用的泵状态无关。
+/// `WPF_ASYNCWINDOWPLACEMENT` 让调用立即返回，不阻塞 engine 线程。
+pub fn set_placement_max_restore(hwnd: isize, maximize: bool) {
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
+    unsafe {
+        if IsWindow(hwnd_ptr) == 0 {
+            return;
+        }
+        let mut wndpl: WINDOWPLACEMENT = std::mem::zeroed();
+        wndpl.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd_ptr, &mut wndpl) == 0 {
+            return;
+        }
+        // WINDOWPLACEMENT.showCmd 是 u32，而 SW_* 常量在 windows-sys 里是 i32。
+        let cmd: u32 = if maximize {
+            SW_MAXIMIZE as u32
+        } else {
+            SW_RESTORE as u32
+        };
+        wndpl.showCmd = cmd;
+        wndpl.flags |= WPF_ASYNCWINDOWPLACEMENT;
+        SetWindowPlacement(hwnd_ptr, &wndpl);
+    }
+}
+
+/// "伪装"修饰键：发一对合成的 Ctrl 按下/抬起（AltSnap `HotkeyUp` 的手法，
+/// `hooks.c:2514-2526`，原注释即 "the alt key is disguised by sending ctrl
+/// keydown/keyup events"）。
+///
+/// **原理**：Windows 只在 Alt 作为**孤立按键**释放时才激活窗口菜单；只要在 Alt 按住
+/// 期间有另一个键被按下，系统就把它当成快捷键组合、不再激活菜单。我们在手势结束时
+/// 塞一次瞬时 Ctrl 敲击，目标应用就永远看不到"孤立 Alt"——菜单栏快捷键提示不再乱弹。
+///
+/// **比"吞掉 Alt 抬起"安全**：不改动任何真实按键事件、不做键位拦截，因此
+/// Alt+Tab / Alt+F4 / Alt+菜单 等系统组合键完全不受影响。
+pub fn disguise_modifier() {
+    // 只发一对 Ctrl down/up：VK-only 注入（wScan 留 0，系统会补扫描码）。
+    let mk = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_CONTROL,
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let seq = [mk(false), mk(true)];
+    unsafe {
+        SendInput(
+            seq.len() as u32,
+            seq.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+    }
+}
+
+/// 尺寸调整相位开/关（`Action::BeginSizeMove` / `EndSizeMove` 的落地）。
+/// 成对调用是硬要求：只发 ENTERSIZEMOVE 会让目标应用永久停在尺寸调整态
+/// （2026-10-16 的卡顿根因，见 `WM_ENTERSIZEMOVE` 常量注释）。
+pub fn notify_size_move(hwnd: isize, start: bool) {
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
+    unsafe {
+        if IsWindow(hwnd_ptr) == 0 {
+            return;
+        }
+        let msg = if start { WM_ENTERSIZEMOVE } else { WM_EXITSIZEMOVE };
+        PostMessageW(hwnd_ptr, msg, 0, 0);
+    }
+}
+
+/// 异步 `SetWindowPos` 之后的同步点（AltSnap `hooks.c:1491-1494`）：
+/// `SWP_ASYNCWINDOWPOS` 让调用立即返回，但目标窗口可能积压一串 WM_MOVE/WM_SIZE，
+/// 表现为窗口"滑过"中途位置。用带超时的 `WM_SYNCPAINT` 逼它把队列消化到当前状态；
+/// 120ms 上限保证绝不长时间阻塞 engine 线程。
+unsafe fn sync_paint(hwnd: HWND) {
+    let mut dummy: usize = 0;
+    SendMessageTimeoutW(hwnd, WM_SYNCPAINT, 0, 0, SMTO_NORMAL, 120, &mut dummy);
+}
+
+/// T2.2 回退执行器：hwnd 有效性守卫 + `SetWindowPos` 保持大小。
+///
+/// **`SWP_ASYNCWINDOWPOS` 是必需的**（AltSnap `MOVEASYNC` 宏 `hooks.c:1510` 必带）：
+/// 不带它时跨进程 `SetWindowPos` 会**同步等待目标窗口线程**处理完；而 engine 线程是
+/// 事件环的唯一消费者，一旦阻塞在这里整条管线就堵住、延迟逐帧累积（"越拖越卡"）。
 pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
     let hwnd_ptr: HWND = hwnd as *mut c_void;
     unsafe {
         if IsWindow(hwnd_ptr) == 0 {
             return;
         }
-        PostMessageW(hwnd_ptr, WM_SIZING, 0x0001, 0);
         SetWindowPos(
             hwnd_ptr,
             std::ptr::null_mut(),
@@ -255,8 +363,9 @@ pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
             y,
             0,
             0,
-            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
         );
+        sync_paint(hwnd_ptr);
     }
 }
 
@@ -265,47 +374,23 @@ pub fn system_double_click_ms() -> u32 {
     unsafe { GetDoubleClickTime() }
 }
 
-/// D. 回退 resize 执行器（engine `Action::SetRect` 的落地，同 fallback_move 范式）：
-/// IsWindow 发放 → 边面需映射 WMSZ_* 的 `WM_SIZING` （让目标应用 reflow，
-/// 同 fallback_move 的 0x0001 先例）→ `SetWindowPos` 直接置新矩形。
+/// 回退 resize 执行器（engine `Action::SetRect` 的落地，同 fallback_move 范式）：
+/// hwnd 有效性守卫 → `SetWindowPos` 置新矩形（异步）。
 ///
-/// `edges` 为 engine.rs 的 RZ_* 纯逻辑霸码（TOP=1/LEFT=2/RIGHT=4/BOTTOM=8）；
-/// WMSZ_* 是 Win32 固定值（LEFT=1,RIGHT=2,TOP=3,TOPLEFT=4,TOPRIGHT=5,
-/// BOTTOM=6,BOTTOMLEFT=7,BOTTOMRIGHT=8），按组合逐项翻译。lParam（“新客户区”
-/// RECT）以窗口矩形近似：DWM 边框 ~7px 误差对 reflow 无害（终端类应用按
-/// 客户区变化量 reflow，方向与量级正确）。
-pub fn fallback_resize(hwnd: isize, x: i32, y: i32, w: i32, h: i32, edges: u8) {
-    const WMSZ_LEFT: u32 = 1;
-    const WMSZ_RIGHT: u32 = 2;
-    const WMSZ_TOP: u32 = 3;
-    const WMSZ_TOPLEFT: u32 = 4;
-    const WMSZ_TOPRIGHT: u32 = 5;
-    const WMSZ_BOTTOM: u32 = 6;
-    const WMSZ_BOTTOMLEFT: u32 = 7;
-    const WMSZ_BOTTOMRIGHT: u32 = 8;
-    use crate::engine::{RZ_BOTTOM, RZ_LEFT, RZ_RIGHT, RZ_TOP};
-    // RZ_* 是位掩码（u8），组合 = 各位或值，所以按位独立判定而非 match 组合值：
-    // edges & RZ_TOP != 0 表示顶边参与，以此类推。
-    let top = edges & RZ_TOP != 0;
-    let bottom = edges & RZ_BOTTOM != 0;
-    let left = edges & RZ_LEFT != 0;
-    let right = edges & RZ_RIGHT != 0;
-    let wmsz = if top && left { WMSZ_TOPLEFT }
-        else if top && right { WMSZ_TOPRIGHT }
-        else if bottom && left { WMSZ_BOTTOMLEFT }
-        else if bottom && right { WMSZ_BOTTOMRIGHT }
-        else if top { WMSZ_TOP }
-        else if left { WMSZ_LEFT }
-        else if right { WMSZ_RIGHT }
-        else if bottom { WMSZ_BOTTOM }
-        else { 0 };
+/// **与旧版的差别（2026-10-16 缩放卡顿修复）**：
+/// 1. 不再发 `WM_SIZING`——旧代码把 `0x0231` 误标为 WM_SIZING（真值 `0x0214`），
+///    实际每帧发的是一条**假的 `WM_ENTERSIZEMOVE`**，且 lParam 传的是本进程栈上 RECT
+///    的指针（跨进程毫无意义，目标可能读到垃圾）。尺寸相位改由 `notify_size_move`
+///    成对下发，由目标应用自己决定何时 reflow。
+/// 2. 不再带 `SWP_FRAMECHANGED`——它每帧强制 `WM_NCCALCSIZE` + 非客户区重算，很贵；
+///    AltSnap 也只在特例才用（`hooks.c:4054`）。
+/// 3. 补 `SWP_ASYNCWINDOWPOS` + `sync_paint`，理由同 `fallback_move`。
+pub fn fallback_resize(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
     let hwnd_ptr: HWND = hwnd as *mut c_void;
     unsafe {
         if IsWindow(hwnd_ptr) == 0 {
             return;
         }
-        let rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
-        PostMessageW(hwnd_ptr, WM_SIZING, wmsz as usize, &rc as *const RECT as isize);
         SetWindowPos(
             hwnd_ptr,
             std::ptr::null_mut(),
@@ -313,7 +398,8 @@ pub fn fallback_resize(hwnd: isize, x: i32, y: i32, w: i32, h: i32, edges: u8) {
             y,
             w,
             h,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
         );
+        sync_paint(hwnd_ptr);
     }
 }

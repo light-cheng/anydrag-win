@@ -105,15 +105,24 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     };
     let ecfg = EngineCfg {
         modifiers_mask: cfg.modifiers_mask(),
-        // C：resize_mask 由 config 现算（[] = 0 = 关闭）；edge_band_px = 10px
-        // 边带是设计默认（高 DPI 下仍好够着，YAGNI 不做配置项）。
+        // resize_mask 由 config 现算（[] = 0 = 关闭）；方向由 engine 按九宫格/就近角判定，
+        // 不再需要"边缘带"配置（2026-10-16 废弃贴边触发，见 engine::resize_edges_for）。
         resize_mask: cfg.resize_mask(),
         threshold_px: cfg.drag_threshold_px,
         double_click_ms: cfg.double_click_ms.unwrap_or_else(winmod::system_double_click_ms),
-        edge_band_px: 10,
     };
     let resolve = |x: i32, y: i32| winmod::resolve_target(x, y, cfg);
     let actions = state.feed(ev, &resolve, &ecfg);
+
+    // 是否需要"伪装修饰键"（见 winmod::disguise_modifier）。
+    // **只在 Alt 是孤立触发键时才需要**：若触发键里本来就有 Ctrl/Shift，那么 Alt 按住
+    // 期间已经有别的键被按下，系统根本不会激活窗口菜单；此时若还硬发一次合成的 Ctrl
+    // 抬起，反而会把用户正按着的 Ctrl **逻辑释放**（2026-10-16 冒烟实测：Alt+Ctrl 缩放
+    // 提交后事件 mods 从 393216 掉成 262144，就是合成 Ctrl-up 干的）。
+    let alt_bit = 1u32 << (0x12 & 0x1F);
+    let other_mod_bits = (1u32 << (0x11 & 0x1F)) | (1u32 << (0x10 & 0x1F)); // Ctrl | Shift
+    let mmask = cfg.modifiers_mask();
+    let needs_disguise = mmask & alt_bit != 0 && mmask & other_mod_bits == 0;
 
     if std::env::var_os("ANYDRAG_DEBUG").is_some() {
         eprintln!(
@@ -128,6 +137,12 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     // 合并：同一事件内多条 SetPos / SetRect 各只执行最后一条（GOAL T3.2 执行规则）。
     let mut last_setpos: Option<(i32, i32)> = None;
     let mut last_setrect: Option<(i32, i32, i32, i32, u8)> = None;
+    // 本手势是否真的做了事（移动/缩放/最大化/还原）。用于在**手势真正收尾（鼠标抬起）**
+    // 时"伪装"修饰键，见 winmod::disguise_modifier。
+    let mut gesture_done = false;
+    // 只有鼠标抬起事件才算手势收尾：提交帧（Armed → Fallback/Resize）也会带一条
+    // `Action::End`，但那只是"armed 相位结束"，此时发伪装会提前释放用户按着的键。
+    let is_up = matches!(ev, EngineEvent::Up { .. });
     for a in actions {
         match a {
             Action::None => {}
@@ -135,18 +150,35 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
                 if let Some(h) = pre_hwnd {
                     winmod::post_sys_command(h, winmod::SC_DRAGMOVE);
                 }
+                gesture_done = true;
+            }
+            // 尺寸调整相位（成对）：目标应用据此把重排推迟到相位结束——
+            // 缩放顺滑的关键配套，见 winmod::WM_ENTERSIZEMOVE 常量注释。
+            Action::BeginSizeMove => {
+                if let Some(h) = pre_hwnd {
+                    winmod::notify_size_move(h, true);
+                }
+                gesture_done = true;
+            }
+            Action::EndSizeMove => {
+                if let Some(h) = pre_hwnd {
+                    winmod::notify_size_move(h, false);
+                }
             }
             Action::SetPos { x, y } => last_setpos = Some((x, y)),
             Action::SetRect { x, y, w, h, edges } => last_setrect = Some((x, y, w, h, edges)),
             Action::Maximize => {
                 if let Some(h) = pre_hwnd {
-                    winmod::post_sys_command(h, winmod::SC_MAXIMIZE);
+                    // 不走目标应用的消息泵（菜单模式下 PostMessage 会被吞），见函数注释。
+                    winmod::set_placement_max_restore(h, true);
                 }
+                gesture_done = true;
             }
             Action::Restore => {
                 if let Some(h) = pre_hwnd {
-                    winmod::post_sys_command(h, winmod::SC_RESTORE);
+                    winmod::set_placement_max_restore(h, false);
                 }
+                gesture_done = true;
             }
             Action::End => {
                 // End 是"相位结束"通知：feed 已把正确的下一状态提交进 `state`
@@ -154,6 +186,15 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
                 // 执行器**不得**在此重置——否则 Up[End] 会抹掉双击记忆，
                 // Down/Up/Down 生产手势永远判不出双击（2026-10-15 冒烟实测：
                 // 四个 Down 全 [None]，窗口纹丝不动，根因即此）。
+                //
+                // 唯一副作用：手势真正收尾（鼠标抬起）时补一次修饰键伪装
+                // （让 Alt 不激活目标应用的菜单栏）。
+                if is_up && gesture_done {
+                    if needs_disguise {
+                        winmod::disguise_modifier();
+                    }
+                    gesture_done = false;
+                }
             }
         }
     }
@@ -162,9 +203,11 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
             winmod::fallback_move(h, x, y);
         }
     }
-    if let Some((rx, ry, rw, rh, edges)) = last_setrect {
+    if let Some((rx, ry, rw, rh, _edges)) = last_setrect {
         if let Some(h) = pre_hwnd {
-            winmod::fallback_resize(h, rx, ry, rw, rh, edges);
+            // edges 不再下传：旧版把它翻成 WMSZ_* 塞进一条跨进程 WM_SIZING（且消息号
+            // 还是错的），2026-10-16 已改为用 BeginSizeMove/EndSizeMove 表达相位。
+            winmod::fallback_resize(h, rx, ry, rw, rh);
         }
     }
 }

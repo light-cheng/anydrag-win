@@ -33,11 +33,17 @@ pub enum Action {
     /// → `PostMessage(hwnd, WM_SYSCOMMAND, SC_DRAGMOVE=0xF012, 0)`，目标应用自己的泵
     ///   跑原生 caption 拖动循环（spike T2.3 验证过才默认启用）。
     BeginNativeDrag,
-    /// → 先 `WM_SIZING(ALT)` 后 `SetWindowPos(hwnd, x, y, 保持大小)`；
+    /// → `PostMessage(hwnd, WM_ENTERSIZEMOVE)`：进入尺寸调整相位。
+    ///   目标应用据此把重排推迟到相位结束（AltSnap `hooks.c:580-591` 手法）。
+    ///   **必须与 `EndSizeMove` 成对**，否则应用永久停在尺寸调整态（卡顿根因）。
+    BeginSizeMove,
+    /// → `PostMessage(hwnd, WM_EXITSIZEMOVE)`：结束尺寸调整相位，应用此时做最终重排。
+    EndSizeMove,
+    /// → `SetWindowPos(hwnd, x, y, 保持大小)`（异步，见 winmod::fallback_move）；
     /// 同一事件多条时执行器只应用最后一条（合并，见 T3.2）。
     SetPos { x: i32, y: i32 },
-    /// → 先 `WM_SIZING(uEdge)` 后 `SetWindowPos(hwnd, x, y, w, h, SWP_FRAMECHANGED)`。
-    /// `edges` = RZ_* 位掩码（纯逻辑，执行器映射成 WMSZ_* 发给目标应用）。
+    /// → `SetWindowPos(hwnd, x, y, w, h)`（异步）。
+    /// `edges` = RZ_* 位掩码（纯逻辑，仅用于计算新矩形，不再发给目标应用）。
     SetRect { x: i32, y: i32, w: i32, h: i32, edges: u8 },
     /// → `PostMessage(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE=0xF030, 0)`。
     Maximize,
@@ -103,9 +109,6 @@ pub struct EngineCfg {
     pub threshold_px: u32,
     /// 双击判定窗口（ms）；None 配置在调用方解析为系统 GetDoubleClickTime()。
     pub double_click_ms: u32,
-    /// resize 边缘带（px）：Down 时刻光标到框边 ≤ 此值 ⇒ 提交为调整大小。
-    /// 0 = 关闭（GOAL 原示例测试按 0 跑，行为逐字不变）；生产注入 10。
-    pub edge_band_px: u32,
 }
 
 impl Default for DragState {
@@ -135,28 +138,60 @@ pub const RZ_BOTTOM: u8 = 8;
 const MIN_W: i32 = 100;
 const MIN_H: i32 = 60;
 
-/// Down 时刻光标到窗口帧边的距离 ≤ `edge_band_px` ⇒ 本手势提交为"调整
-/// 大小"而非移动（`edge_band_px=0` 关闭本功能——GOAL 原示例测试按 0 跑，
-/// 行为逐字不变；生产由 engine_loop 注入 10px）。
-fn resize_edges_for(t: &Target, x: i32, y: i32, band_px: u32) -> u8 {
-    if t.is_maximized || band_px == 0 {
-        // 最大化窗 OS 语义上不可 resize（双击 Restore 才是出路）→ 走移动手势。
+/// Down 时刻按**光标在窗口内的位置**决定往哪个方向缩放——**不需要贴边**。
+///
+/// 把窗口框分成 3×3 九宫格（各方向按三分之一切分）：
+/// - 左列/右列 → 该侧竖边跟随光标；上排/下排 → 该侧横边跟随光标；
+/// - 中列/中排 → 该方向不动（只缩放另一个维度）；
+/// - **正中心格**（两个方向都在中间）→ 取**就近角**（按到四角的距离）。
+///
+/// 这样"在窗口任意位置按住触发键拖动"都能缩放，正是 AnyDrag"从最近的角缩放、
+/// 不必瞄准极小的角落手柄"的语义。此前的实现在窗口框 10px 边带内才触发——那等于
+/// 把原生缩放又实现了一遍、而且比原生更难瞄（原生边框约 7px），属无意义设计，
+/// 2026-10-16 用户指出后废弃（见 `docs/acceptance.md` 的变更记录）。
+///
+/// 最大化窗口返回 0（OS 语义上不可缩放，让调用方落回移动手势）。
+fn resize_edges_for(t: &Target, x: i32, y: i32) -> u8 {
+    if t.is_maximized {
         return 0;
     }
     let [l, tp, r, b] = t.frame;
-    // frame 坐标 i32，abs_diff 结果转 u32 与 band_px 比较（物理像素量级远小于 u32 上界）。
+    let w = r - l;
+    let h = b - tp;
+    // 三分之一分界（窗口过小时退化为按中心二分，保证任何位置都有方向可判）。
+    let (lx, rx) = if w >= 3 { (l + w / 3, r - w / 3) } else { (l, r) };
+    let (ty, by) = if h >= 3 { (tp + h / 3, b - h / 3) } else { (tp, b) };
     let mut e = 0u8;
-    if y.abs_diff(tp) as u32 <= band_px {
-        e |= RZ_TOP;
+    if x < lx {
+        e |= RZ_LEFT;
+    } else if x >= rx {
+        e |= RZ_RIGHT;
     }
-    if y.abs_diff(b) as u32 <= band_px {
+    if y < ty {
+        e |= RZ_TOP;
+    } else if y >= by {
         e |= RZ_BOTTOM;
     }
-    if x.abs_diff(l) as u32 <= band_px {
-        e |= RZ_LEFT;
+    if e == 0 {
+        nearest_corner(t, x, y)
+    } else {
+        e
     }
-    if x.abs_diff(r) as u32 <= band_px {
+}
+
+/// 就近角（正中心格用）：按光标到窗口四角的距离选最近的角，保证"抓哪儿都能缩"。
+fn nearest_corner(t: &Target, x: i32, y: i32) -> u8 {
+    let [l, tp, r, b] = t.frame;
+    let mut e = 0u8;
+    if (x - l).abs() <= (x - r).abs() {
+        e |= RZ_LEFT;
+    } else {
         e |= RZ_RIGHT;
+    }
+    if (y - tp).abs() <= (y - b).abs() {
+        e |= RZ_TOP;
+    } else {
+        e |= RZ_BOTTOM;
     }
     e
 }
@@ -217,12 +252,13 @@ impl DragState {
         match ev {
             EngineEvent::Down { x, y, mods } => {
                 // resize 路径（触发键组合 = `cfg.resize_mask`，默认 Alt+Ctrl；mask=0 关闭）：
-                // 组合键齐全 + 光标在目标框边带内 ⇒ 本手势提交为"调整大小"；
-                // 不贴边则**落到常规路径**（Alt 部分恰好齐全 ⇒ 仍可拖）。
+                // 组合键齐全 ⇒ 在窗口**任意位置**按下即提交为"调整大小"，方向由
+                // `resize_edges_for` 按九宫格/就近角判定（不需要贴边，见其注释）。
+                // 最大化窗口返回 edges=0 ⇒ 落到常规路径（仍可拖）。
                 // 单按 Alt（拖拽键）永远走常规路径，不触发 resize。
                 if cfg.resize_mask != 0 && *mods & cfg.resize_mask == cfg.resize_mask {
                     if let Some(target) = resolve(*x, *y) {
-                        let edges = resize_edges_for(&target, *x, *y, cfg.edge_band_px);
+                        let edges = resize_edges_for(&target, *x, *y);
                         if edges != 0 {
                             *self = DragState::ArmedResize {
                                 target,
@@ -318,10 +354,14 @@ impl DragState {
                                 ),
                                 Strategy::Fallback => (
                                     // 规则 3/4：SetPos = 起点帧 + 位移。
-                                    vec![Action::SetPos {
-                                        x: target.frame[0] + (*x - start[0]),
-                                        y: target.frame[1] + (*y - start[1]),
-                                    }],
+                                    // 首帧同时开尺寸调整相位（目标应用据此把重排推迟到 Up）。
+                                    vec![
+                                        Action::BeginSizeMove,
+                                        Action::SetPos {
+                                            x: target.frame[0] + (*x - start[0]),
+                                            y: target.frame[1] + (*y - start[1]),
+                                        },
+                                    ],
                                     Some(DragState::Fallback {
                                         target: target.clone(),
                                         start: *start,
@@ -349,10 +389,11 @@ impl DragState {
                         } else if dist_sq([*x, *y], *start) < th * th {
                             (vec![Action::None], None)
                         } else {
-                            let edges = resize_edges_for(target, start[0], start[1], cfg.edge_band_px);
+                            let edges = resize_edges_for(target, start[0], start[1]);
                             let (rx, ry, rw, rh) = resize_rect(target, *start, edges, *x, *y);
                             (
                                 vec![
+                                    Action::BeginSizeMove,
                                     Action::SetRect {
                                         x: rx,
                                         y: ry,
@@ -401,12 +442,20 @@ impl DragState {
             // 生产手势下杀死双击；此处按"Up 结束本 click 相位、保留双击记忆"实现，
             // GOAL 示例测试（连续 Down/Down）与此语义兼容）。
             EngineEvent::Up { .. } => {
+                // 已提交的移动/缩放相位 → 先关尺寸调整相位（与提交时的 BeginSizeMove 成对），
+                // 应用在这一刻做最终重排。
+                let in_size_phase =
+                    matches!(self, DragState::Fallback { .. } | DragState::Resize { .. });
                 let keep_armed =
                     matches!(self, DragState::Armed { .. } | DragState::ArmedResize { .. });
                 if !keep_armed {
                     *self = DragState::Idle;
                 }
-                vec![Action::End]
+                if in_size_phase {
+                    vec![Action::EndSizeMove, Action::End]
+                } else {
+                    vec![Action::End]
+                }
             }
         }
     }
@@ -430,7 +479,6 @@ mod tests {
                 threshold_px: 5,
                 double_click_ms: 500,
                 resize_mask: 0,
-                edge_band_px: 10,
             }
         }
     }
@@ -575,7 +623,8 @@ mod tests {
         s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
         let a = s.feed(&move_(106, 203, MOD_ALT), &resolve_fallback(), &cfg);
         // frame L,T = 100,100；位移 +6,+3 → 106,103。
-        assert_eq!(a, vec![Action::SetPos { x: 106, y: 103 }]);
+        // 首帧同时开尺寸调整相位（BeginSizeMove），见 Action 注释。
+        assert_eq!(a, vec![Action::BeginSizeMove, Action::SetPos { x: 106, y: 103 }]);
         assert!(matches!(s, DragState::Fallback { .. }));
     }
 
@@ -622,7 +671,11 @@ mod tests {
         s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
         s.feed(&move_(106, 200, MOD_ALT), &resolve_fallback(), &cfg); // → Fallback
         s.feed(&move_(120, 200, MOD_ALT), &resolve_fallback(), &cfg);
-        assert_eq!(s.feed(&up(120, 200, MOD_ALT), &resolve_fallback(), &cfg), vec![Action::End]);
+        assert_eq!(
+            s.feed(&up(120, 200, MOD_ALT), &resolve_fallback(), &cfg),
+            vec![Action::EndSizeMove, Action::End],
+            "committed move must close the size-move phase it opened"
+        );
         assert!(matches!(s, DragState::Idle));
     }
 
@@ -678,7 +731,6 @@ mod tests {
     fn cfg_resize() -> EngineCfg {
         let mut c = EngineCfg::test();
         c.resize_mask = CTRL_BIT;
-        c.edge_band_px = 10;
         c
     }
 
@@ -695,6 +747,7 @@ mod tests {
         assert_eq!(
             a,
             vec![
+                Action::BeginSizeMove,
                 Action::SetRect {
                     x: 100,
                     y: 100,
@@ -730,6 +783,7 @@ mod tests {
         assert_eq!(
             a,
             vec![
+                Action::BeginSizeMove,
                 Action::SetRect {
                     x: 400,
                     y: 100,
@@ -751,6 +805,7 @@ mod tests {
         assert_eq!(
             a,
             vec![
+                Action::BeginSizeMove,
                 Action::SetRect {
                     x: 100,
                     y: 100,
@@ -764,12 +819,58 @@ mod tests {
     }
 
     #[test]
-    fn resize_client_click_is_noop() {
-        // Ctrl + 客户端区（不贴边）→ 无事发生（规则：resize 只在框边带内生效）。
+    fn resize_grabs_from_anywhere_no_edge_aiming() {
+        // 核心语义（2026-10-16 用户指出旧设计"贴边才触发缩放"等于把原生缩放重做一遍、
+        // 而且比原生更难瞄）：在窗口**任意位置**按住触发键都应进入缩放，不需要贴边。
+        // frame [100,100,500,400] → 九宫格 x 分界 233/367、y 分界 200/300。
+        // (300,250) 落在正中心格 → 取就近角：(300 到左 200 / 到右 200) 平局取左，
+        // (250 到上 150 / 到下 150) 平局取上 → LEFT|TOP。
         let mut s = DragState::Idle;
         let cfg = cfg_resize();
         assert_eq!(s.feed(&down(300, 250, CTRL_BIT), &resolve_rz(), &cfg), vec![Action::None]);
-        assert!(matches!(s, DragState::Idle));
+        assert!(
+            matches!(s, DragState::ArmedResize { .. }),
+            "client-area grab must arm a resize, not fall through to move"
+        );
+        let a = s.feed(&move_(320, 270, CTRL_BIT), &resolve_rz(), &cfg); // dx=+20, dy=+20
+        // 左/上边跟随光标：nl=120, nt=120 → w=380, h=280
+        assert_eq!(
+            a,
+            vec![
+                Action::BeginSizeMove,
+                Action::SetRect {
+                    x: 120,
+                    y: 120,
+                    w: 380,
+                    h: 280,
+                    edges: RZ_LEFT | RZ_TOP
+                },
+                Action::End
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_middle_column_only_vertical() {
+        // 中列（左右都在中间）→ 只有横边跟随：x=300 在中列，y=380 在下排 → BOTTOM。
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        s.feed(&down(300, 380, CTRL_BIT), &resolve_rz(), &cfg);
+        let a = s.feed(&move_(300, 400, CTRL_BIT), &resolve_rz(), &cfg); // dy=+20
+        assert_eq!(
+            a,
+            vec![
+                Action::BeginSizeMove,
+                Action::SetRect {
+                    x: 100,
+                    y: 100,
+                    w: 400,
+                    h: 320,
+                    edges: RZ_BOTTOM
+                },
+                Action::End
+            ]
+        );
     }
 
     #[test]
@@ -803,5 +904,33 @@ mod tests {
         s.feed(&down(496, 250, MOD_ALT), &resolve_rz(), &cfg);
         let a = s.feed(&down(496, 250, MOD_ALT), &resolve_rz(), &cfg);
         assert_eq!(a, vec![Action::Maximize, Action::End]);
+    }
+
+    // ===== 尺寸调整相位成对性（2026-10-16 缩放卡顿修复的回归守卫）=====
+
+    #[test]
+    fn resize_up_closes_size_move_phase() {
+        // 提交缩放后 Up 必须发 EndSizeMove：只发 BeginSizeMove 会让目标应用永久停在
+        // 尺寸调整态、把重排无限推迟——这正是"缩放有很严重的延迟"的根因。
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        s.feed(&down(496, 250, CTRL_BIT), &resolve_rz(), &cfg);
+        s.feed(&move_(516, 250, CTRL_BIT), &resolve_rz(), &cfg); // 提交 → Resize
+        let a = s.feed(&up(516, 250, CTRL_BIT), &resolve_rz(), &cfg);
+        assert_eq!(a, vec![Action::EndSizeMove, Action::End]);
+        assert!(matches!(s, DragState::Idle));
+    }
+
+    #[test]
+    fn size_move_phase_opened_once_per_gesture() {
+        // BeginSizeMove 只在提交那一帧出现一次；后续 Move 只产 SetPos（不重复开相位）。
+        let mut s = DragState::Idle;
+        let cfg = EngineCfg::test();
+        s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
+        let a1 = s.feed(&move_(106, 200, MOD_ALT), &resolve_fallback(), &cfg);
+        assert_eq!(a1[0], Action::BeginSizeMove);
+        assert_eq!(a1.len(), 2, "commit frame = BeginSizeMove + SetPos");
+        let a2 = s.feed(&move_(120, 200, MOD_ALT), &resolve_fallback(), &cfg);
+        assert_eq!(a2, vec![Action::SetPos { x: 120, y: 100 }]);
     }
 }
