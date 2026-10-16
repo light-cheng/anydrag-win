@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindow,
     IsWindowVisible, PostMessageW, SetWindowPos, GWL_EXSTYLE, SWP_NOSIZE, SWP_NOACTIVATE,
-    SWP_NOZORDER, WM_SYSCOMMAND, WS_EX_TOOLWINDOW,
+    SWP_NOZORDER, SWP_FRAMECHANGED, WM_SYSCOMMAND, WS_EX_TOOLWINDOW,
 };
 
 // ---- 未文档化但数十年稳定的 syscommand 常量（GOAL §3：0xF012 由 T2.3 spike 背书）----
@@ -66,10 +66,10 @@ pub fn frame_bounds(hwnd: isize) -> Option<[i32; 4]> {
 /// 进程文件名（小写）。取不到（elevated 进程 UIPI 拒绝 OpenProcess 等）→ None，
 /// 调用方（resolve_target）据此跳过手势（GOAL 风险 #4：非提权进程对 elevated 窗口不可见）。
 pub fn exe_name(hwnd: isize) -> Option<String> {
-    let h: HWND = hwnd as *mut c_void;
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
     unsafe {
         let mut pid: u32 = 0;
-        if GetWindowThreadProcessId(h, &mut pid) == 0 || pid == 0 {
+        if GetWindowThreadProcessId(hwnd_ptr, &mut pid) == 0 || pid == 0 {
             return None;
         }
         let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -108,7 +108,7 @@ pub fn resolve_target(x: i32, y: i32, cfg: &Config) -> Option<Target> {
     let dbg = std::env::var_os("ANYDRAG_DEBUG").is_some();
     // 候选收集：EnumWindows 按 Z 序（顶先）枚举，回调同步执行；栈上 RefCell
     // 存活覆盖整个调用，零泄漏。
-    let mut st: std::cell::RefCell<(i32, i32, Vec<isize>)> =
+    let st: std::cell::RefCell<(i32, i32, Vec<isize>)> =
         std::cell::RefCell::new((x, y, Vec::new()));
     unsafe extern "system" fn collect(hwnd: HWND, lparam: isize) -> i32 {
         let st = lparam as *const std::cell::RefCell<(i32, i32, Vec<isize>)>;
@@ -242,14 +242,14 @@ pub fn post_sys_command(hwnd: isize, cmd: u32) {
 
 /// T2.2 回退执行器：hwnd 有效性守卫 + WM_SIZING(ALT 标记) + SetWindowPos 保持大小。
 pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
-    let h: HWND = hwnd as *mut c_void;
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
     unsafe {
-        if IsWindow(h) == 0 {
+        if IsWindow(hwnd_ptr) == 0 {
             return;
         }
-        PostMessageW(h, WM_SIZING, 0x0001, 0);
+        PostMessageW(hwnd_ptr, WM_SIZING, 0x0001, 0);
         SetWindowPos(
-            h,
+            hwnd_ptr,
             std::ptr::null_mut(),
             x,
             y,
@@ -263,4 +263,57 @@ pub fn fallback_move(hwnd: isize, x: i32, y: i32) {
 /// 系统双击间隔（ms）：配置 double_click_ms=None 时由调用方用此值解析。
 pub fn system_double_click_ms() -> u32 {
     unsafe { GetDoubleClickTime() }
+}
+
+/// D. 回退 resize 执行器（engine `Action::SetRect` 的落地，同 fallback_move 范式）：
+/// IsWindow 发放 → 边面需映射 WMSZ_* 的 `WM_SIZING` （让目标应用 reflow，
+/// 同 fallback_move 的 0x0001 先例）→ `SetWindowPos` 直接置新矩形。
+///
+/// `edges` 为 engine.rs 的 RZ_* 纯逻辑霸码（TOP=1/LEFT=2/RIGHT=4/BOTTOM=8）；
+/// WMSZ_* 是 Win32 固定值（LEFT=1,RIGHT=2,TOP=3,TOPLEFT=4,TOPRIGHT=5,
+/// BOTTOM=6,BOTTOMLEFT=7,BOTTOMRIGHT=8），按组合逐项翻译。lParam（“新客户区”
+/// RECT）以窗口矩形近似：DWM 边框 ~7px 误差对 reflow 无害（终端类应用按
+/// 客户区变化量 reflow，方向与量级正确）。
+pub fn fallback_resize(hwnd: isize, x: i32, y: i32, w: i32, h: i32, edges: u8) {
+    const WMSZ_LEFT: u32 = 1;
+    const WMSZ_RIGHT: u32 = 2;
+    const WMSZ_TOP: u32 = 3;
+    const WMSZ_TOPLEFT: u32 = 4;
+    const WMSZ_TOPRIGHT: u32 = 5;
+    const WMSZ_BOTTOM: u32 = 6;
+    const WMSZ_BOTTOMLEFT: u32 = 7;
+    const WMSZ_BOTTOMRIGHT: u32 = 8;
+    use crate::engine::{RZ_BOTTOM, RZ_LEFT, RZ_RIGHT, RZ_TOP};
+    // RZ_* 是位掩码（u8），组合 = 各位或值，所以按位独立判定而非 match 组合值：
+    // edges & RZ_TOP != 0 表示顶边参与，以此类推。
+    let top = edges & RZ_TOP != 0;
+    let bottom = edges & RZ_BOTTOM != 0;
+    let left = edges & RZ_LEFT != 0;
+    let right = edges & RZ_RIGHT != 0;
+    let wmsz = if top && left { WMSZ_TOPLEFT }
+        else if top && right { WMSZ_TOPRIGHT }
+        else if bottom && left { WMSZ_BOTTOMLEFT }
+        else if bottom && right { WMSZ_BOTTOMRIGHT }
+        else if top { WMSZ_TOP }
+        else if left { WMSZ_LEFT }
+        else if right { WMSZ_RIGHT }
+        else if bottom { WMSZ_BOTTOM }
+        else { 0 };
+    let hwnd_ptr: HWND = hwnd as *mut c_void;
+    unsafe {
+        if IsWindow(hwnd_ptr) == 0 {
+            return;
+        }
+        let rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        PostMessageW(hwnd_ptr, WM_SIZING, wmsz as usize, &rc as *const RECT as isize);
+        SetWindowPos(
+            hwnd_ptr,
+            std::ptr::null_mut(),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
 }

@@ -23,11 +23,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetSystemMetrics, GetWindowTextW, IsWindowVisible, PostMessageW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, WM_CLOSE,
+    SetForegroundWindow, SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_CLOSE,
 };
 
 const VK_MENU: u16 = 0x12;
+/// resize 触发键（默认配置 = Alt+Ctrl 组合，见 config.rs DEFAULT_RESIZE_MODS）。
+const VK_CONTROL: u16 = 0x11;
 const DRAG_PX: i32 = 80;
+/// resize 探针拖拽量（px）：右移 +80 ⇒ 宽度 +80，PASS 判据 ≥ 40（半量容差）。
+const RZ_DRAG_PX: i32 = 80;
 
 fn frame_of(hwnd: HWND) -> Option<[i32; 4]> {
     unsafe {
@@ -103,6 +108,35 @@ fn find_window(sub: &str) -> Option<HWND> {
     (v != 0).then(|| v as HWND)
 }
 
+/// 把目标窗抬到 Z 序最前再测。**必要前置**：若测试窗被置顶/全屏窗遮挡（2026-10-16
+/// 实测：本机远程桌面客户端 gameviewer.exe 有全屏窗），引擎的命中测试会解析到遮挡窗
+/// 而不是测试窗，所有手势测出来都是 dx=0 的假 FAIL。probe_scandrag 早已有
+/// `SetForegroundWindow`，本驱动此前漏了这一步。
+fn raise_target(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        SetForegroundWindow(hwnd);
+    }
+    std::thread::sleep(Duration::from_millis(250));
+}
+
+/// 测完恢复非置顶（不改动用户窗口的置顶状态）；窗口已关（close 子命令）时静默失败。
+fn restore_z(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 fn mouse_move_abs(x: i32, y: i32) {
     unsafe {
         let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
@@ -171,6 +205,8 @@ fn main() {
         eprintln!("window not found: {sub}");
         std::process::exit(2);
     };
+    // 先抬到最前：否则被全屏/置顶窗遮挡时，引擎命中测试解析到的是遮挡窗（见 raise_target）。
+    raise_target(hwnd);
     let f0 = frame_of(hwnd).expect("dwm frame");
     match cmd {
         "frame" => {
@@ -182,7 +218,9 @@ fn main() {
         }
         "alt-drag" => {
             let cx = (f0[0] + f0[2]) / 2;
-            let cy = f0[1] + 40; // 客户区（标题栏 ~32-39px，+40 落在客户区）
+            // 必须落在**明确无歧义的客户区**：+40 可能仍压在标题栏上，那样 PASS 会来自
+            // OS 自带的标题栏拖动而非本工具（假阳性）。+80 稳在客户区。
+            let cy = f0[1] + 80;
             key_event(VK_MENU, false);
             mouse_move_abs(cx, cy);
             std::thread::sleep(Duration::from_millis(80));
@@ -245,6 +283,30 @@ fn main() {
                 if maximized && restored { "PASS" } else { "FAIL" }
             );
         }
+        "ctrl-resize" => {
+            // 找窗口 → 光标移到右边框外侧 5px、垂直居中 → Alt+Ctrl 按下 → LDOWN →
+            // 右移 +80px → LUP → 按键释放 → 读 f1。判据：f1 宽 − f0 宽 ≥ 40。
+            let rx = f0[2] + 5; // 右边框外侧 5px（DWM 帧内 10px 边带）
+            let ry = (f0[1] + f0[3]) / 2;
+            key_event(VK_MENU, false);
+            key_event(VK_CONTROL, false);
+            mouse_move_abs(rx, ry);
+            std::thread::sleep(Duration::from_millis(80));
+            mouse_button(true); // 引擎：Down(mods=Alt|Ctrl, 贴右边) → ArmedResize
+            std::thread::sleep(Duration::from_millis(60));
+            for i in 1..=4 {
+                mouse_move_abs(rx + RZ_DRAG_PX * i / 4, ry); // 每 Move → SetRect
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            mouse_button(false);
+            key_event(VK_CONTROL, true);
+            key_event(VK_MENU, true);
+            std::thread::sleep(Duration::from_millis(300));
+            let f1 = frame_of(hwnd).expect("dwm frame");
+            let dw = (f1[2] - f1[0]) - (f0[2] - f0[0]);
+            println!("ctrl-resize: w0={} w1={} (cmd +{RZ_DRAG_PX}px)", f0[2] - f0[0], f1[2] - f1[0]);
+            println!("CTRL_RESIZE={}", if dw >= 40 { "PASS" } else { "FAIL" });
+        }
         "close" => {
             unsafe {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -259,4 +321,5 @@ fn main() {
             std::process::exit(1);
         }
     }
+    restore_z(hwnd);
 }

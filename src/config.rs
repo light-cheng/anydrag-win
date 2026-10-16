@@ -10,6 +10,11 @@ use std::sync::atomic::AtomicBool;
 
 /// 触发修饰键默认值：VK_MENU (Alt) = 0x12。
 pub const DEFAULT_MODS: [u16; 1] = [0x12];
+/// resize 触发键默认值：**Alt+Ctrl 同时按住**（VK_MENU=0x12 与 VK_CONTROL=0x11；
+/// mask 匹配要求两 bit 同时置位，缺一即不触发）。单按 Alt 仍是拖拽/双击专属
+/// （用户 2026-10-16 定稿：resize 不单独占用 Ctrl，改为 Alt+Ctrl 组合）；
+/// 可配置 `resize_modifiers`，`[]` = 关闭 resize 功能。
+pub const DEFAULT_RESIZE_MODS: [u16; 2] = [0x11, 0x12];
 
 /// 内存"启用"开关（`Config.enabled` 的 AtomicBool 镜像，T3.3 引入）：
 /// 托盘线程要翻转它、engine 线程要读它——`Arc<Config>` 内的 bool 不能原地
@@ -30,6 +35,10 @@ pub struct Config {
     pub enabled: bool,
     /// VK 码列表，要求"全部按下"才算触发；默认 [Alt]。
     pub modifiers: Vec<u16>,
+    /// resize 触发键 VK 码列表，要求"全部同时按下"；默认 [Ctrl, Alt]（Alt+Ctrl
+    /// 组合，2026-10-16 用户定稿；单按 Alt 仍为拖拽/双击专属）。光标须落在
+    /// 目标窗口框边带（10px）内才提交为调整大小；`[]` = 关闭 resize。
+    pub resize_modifiers: Vec<u16>,
     /// 位移达到该像素数才提交拖动，否则视为双击候选。默认 5。
     pub drag_threshold_px: u32,
     /// 双击判定窗口。None = 跟随系统 GetDoubleClickTime()；默认 None。
@@ -49,6 +58,7 @@ impl Default for Config {
         Self {
             enabled: true,
             modifiers: DEFAULT_MODS.to_vec(),
+            resize_modifiers: DEFAULT_RESIZE_MODS.to_vec(),
             drag_threshold_px: 5,
             double_click_ms: None,
             default_strategy: DEFAULT_STRATEGY.to_string(),
@@ -59,6 +69,13 @@ impl Default for Config {
 }
 
 /// 配置路径：`%APPDATA%\anydrag-win\config.json`（手拼，不引 directories crate）。
+/// VK 列表 → mask：bit = `VK & 0x1F`（与 mods.rs / hook.rs 同一位规则；
+/// u32 加宽见 mods.rs 模块注记）。空列表 → 0。
+/// `modifiers_mask()` / `resize_mask()` 共用，避免两套位规则漂移。
+pub fn mask_of(vks: &[u16]) -> u32 {
+    vks.iter().fold(0u32, |m, &vk| m | 1u32 << (vk & 0x1F))
+}
+
 fn config_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     PathBuf::from(appdata).join("anydrag-win").join("config.json")
@@ -78,9 +95,13 @@ impl Config {
     /// 构造"触发所需修饰键"mask：bit = `VK & 0x1F`（与 mods.rs / hook.rs 同一位规则；
     /// u32 加宽见 mods.rs 模块注记）。engine_loop 每次 feed 现算（O(≤4) 位运算）。
     pub fn modifiers_mask(&self) -> u32 {
-        self.modifiers
-            .iter()
-            .fold(0u32, |m, &vk| m | 1u32 << (vk & 0x1F))
+        mask_of(&self.modifiers)
+    }
+
+    /// resize 触发键 mask（`resize_modifiers`，位规则同 `modifiers_mask`）；
+    /// 空列表 = 0 = 关闭 resize 路径。
+    pub fn resize_mask(&self) -> u32 {
+        mask_of(&self.resize_modifiers)
     }
 
     /// 原子写：先写同目录 `.json.tmp` 再 rename——避免托盘写回时半截文件毁掉配置。

@@ -37,7 +37,15 @@ pub fn run_in_thread(cfg: Arc<Config>) -> u32 {
         .spawn(move || {
             let tid = unsafe { GetCurrentThreadId() };
             // 钩子线程必须绑定到 engine 线程（PostThreadMessage 目标）。
-            hook::spawn(tid, &cfg.modifiers);
+            // E：读键 = modifiers ∪ resize_modifiers 去重并集——resize_mask 的
+            // 触发位（如 Ctrl bit17）若缺位，事件 mods 永远没有该 bit，resize 永不触发。
+            let mut vks: Vec<u16> = cfg.modifiers.clone();
+            for &vk in cfg.resize_modifiers.iter() {
+                if !vks.contains(&vk) {
+                    vks.push(vk);
+                }
+            }
+            hook::spawn(tid, &vks);
             tx.send(tid).ok();
             run(cfg);
         })
@@ -90,13 +98,19 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     let pre_hwnd: Option<isize> = match state {
         DragState::Armed { target, .. }
         | DragState::Native { target }
-        | DragState::Fallback { target, .. } => Some(target.hwnd),
+        | DragState::Fallback { target, .. }
+        | DragState::ArmedResize { target, .. }
+        | DragState::Resize { target, .. } => Some(target.hwnd),
         DragState::Idle => None,
     };
     let ecfg = EngineCfg {
         modifiers_mask: cfg.modifiers_mask(),
+        // C：resize_mask 由 config 现算（[] = 0 = 关闭）；edge_band_px = 10px
+        // 边带是设计默认（高 DPI 下仍好够着，YAGNI 不做配置项）。
+        resize_mask: cfg.resize_mask(),
         threshold_px: cfg.drag_threshold_px,
         double_click_ms: cfg.double_click_ms.unwrap_or_else(winmod::system_double_click_ms),
+        edge_band_px: 10,
     };
     let resolve = |x: i32, y: i32| winmod::resolve_target(x, y, cfg);
     let actions = state.feed(ev, &resolve, &ecfg);
@@ -111,8 +125,9 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
         );
     }
 
-    // 合并：同一事件内多条 SetPos 只执行最后一条（GOAL T3.2 执行规则）。
+    // 合并：同一事件内多条 SetPos / SetRect 各只执行最后一条（GOAL T3.2 执行规则）。
     let mut last_setpos: Option<(i32, i32)> = None;
+    let mut last_setrect: Option<(i32, i32, i32, i32, u8)> = None;
     for a in actions {
         match a {
             Action::None => {}
@@ -122,6 +137,7 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
                 }
             }
             Action::SetPos { x, y } => last_setpos = Some((x, y)),
+            Action::SetRect { x, y, w, h, edges } => last_setrect = Some((x, y, w, h, edges)),
             Action::Maximize => {
                 if let Some(h) = pre_hwnd {
                     winmod::post_sys_command(h, winmod::SC_MAXIMIZE);
@@ -144,6 +160,11 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) {
     if let Some((x, y)) = last_setpos {
         if let Some(h) = pre_hwnd {
             winmod::fallback_move(h, x, y);
+        }
+    }
+    if let Some((rx, ry, rw, rh, edges)) = last_setrect {
+        if let Some(h) = pre_hwnd {
+            winmod::fallback_resize(h, rx, ry, rw, rh, edges);
         }
     }
 }

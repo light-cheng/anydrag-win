@@ -36,6 +36,9 @@ pub enum Action {
     /// → 先 `WM_SIZING(ALT)` 后 `SetWindowPos(hwnd, x, y, 保持大小)`；
     /// 同一事件多条时执行器只应用最后一条（合并，见 T3.2）。
     SetPos { x: i32, y: i32 },
+    /// → 先 `WM_SIZING(uEdge)` 后 `SetWindowPos(hwnd, x, y, w, h, SWP_FRAMECHANGED)`。
+    /// `edges` = RZ_* 位掩码（纯逻辑，执行器映射成 WMSZ_* 发给目标应用）。
+    SetRect { x: i32, y: i32, w: i32, h: i32, edges: u8 },
     /// → `PostMessage(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE=0xF030, 0)`。
     Maximize,
     /// → `PostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE=0xF120, 0)`。
@@ -66,12 +69,24 @@ pub enum DragState {
         strategy: Strategy,
         armed_at: Instant,
     },
+    /// resize 手势已按下、未达位移阈值（触发键组合 = `cfg.resize_mask`，默认 Alt+Ctrl；
+    /// 光标须落在目标框边带内才会进入本状态，Down 时刻按 `resize_edges_for` 判定）。
+    ArmedResize {
+        target: Target,
+        start: [i32; 2],
+    },
     Native {
         target: Target,
     },
     Fallback {
         target: Target,
         start: [i32; 2],
+    },
+    /// 已提交的 resize：每个 Move 一条 SetRect（相对 start 累计，与 Fallback 同范式）。
+    Resize {
+        target: Target,
+        start: [i32; 2],
+        edges: u8,
     },
 }
 
@@ -83,9 +98,14 @@ pub enum DragState {
 pub struct EngineCfg {
     /// 触发所需的修饰键 mask（bit = `VK & 0x1F`，见 mods.rs）。
     pub modifiers_mask: u32,
+    /// resize 触发键 mask（位规则同 `modifiers_mask`）；0 = 关闭 resize 路径。
+    pub resize_mask: u32,
     pub threshold_px: u32,
     /// 双击判定窗口（ms）；None 配置在调用方解析为系统 GetDoubleClickTime()。
     pub double_click_ms: u32,
+    /// resize 边缘带（px）：Down 时刻光标到框边 ≤ 此值 ⇒ 提交为调整大小。
+    /// 0 = 关闭（GOAL 原示例测试按 0 跑，行为逐字不变）；生产注入 10。
+    pub edge_band_px: u32,
 }
 
 impl Default for DragState {
@@ -101,6 +121,88 @@ fn dist_sq(a: [i32; 2], b: [i32; 2]) -> i64 {
     dx * dx + dy * dy
 }
 
+// ===== 调整大小（Alt + 窗口边缘/角落拖动）=====
+
+/// 边缘位掩码（纯逻辑，执行器映射为 WM_SIZING 的 WMSZ_*）：
+/// 光标落在目标 DWM 帧哪条边 10px 带内就置哪位；角落 = 两位。
+pub const RZ_TOP: u8 = 1;
+pub const RZ_LEFT: u8 = 2;
+pub const RZ_RIGHT: u8 = 4;
+pub const RZ_BOTTOM: u8 = 8;
+
+/// 调整大小的最小跟踪尺寸（px）：防窗口被拉到 0（简化：不按应用各自
+/// 的 min size，MVP 记录于模块注记）。
+const MIN_W: i32 = 100;
+const MIN_H: i32 = 60;
+
+/// Down 时刻光标到窗口帧边的距离 ≤ `edge_band_px` ⇒ 本手势提交为"调整
+/// 大小"而非移动（`edge_band_px=0` 关闭本功能——GOAL 原示例测试按 0 跑，
+/// 行为逐字不变；生产由 engine_loop 注入 10px）。
+fn resize_edges_for(t: &Target, x: i32, y: i32, band_px: u32) -> u8 {
+    if t.is_maximized || band_px == 0 {
+        // 最大化窗 OS 语义上不可 resize（双击 Restore 才是出路）→ 走移动手势。
+        return 0;
+    }
+    let [l, tp, r, b] = t.frame;
+    // frame 坐标 i32，abs_diff 结果转 u32 与 band_px 比较（物理像素量级远小于 u32 上界）。
+    let mut e = 0u8;
+    if y.abs_diff(tp) as u32 <= band_px {
+        e |= RZ_TOP;
+    }
+    if y.abs_diff(b) as u32 <= band_px {
+        e |= RZ_BOTTOM;
+    }
+    if x.abs_diff(l) as u32 <= band_px {
+        e |= RZ_LEFT;
+    }
+    if x.abs_diff(r) as u32 <= band_px {
+        e |= RZ_RIGHT;
+    }
+    e
+}
+
+/// 由"起点帧 + 起点光标 + 当前光标"算新窗口矩形（相对 start 累计，
+/// 与 Fallback 移动同范式）；`edges` 决定哪些边跟随光标。
+fn resize_rect(t: &Target, start: [i32; 2], edges: u8, x: i32, y: i32) -> (i32, i32, i32, i32) {
+    let [l, tp, r, b] = t.frame;
+    let dx = x - start[0];
+    let dy = y - start[1];
+    let mut nl = l;
+    let mut nt = tp;
+    let mut nr = r;
+    let mut nb = b;
+    if edges & RZ_LEFT != 0 {
+        nl = l + dx; // 左边界跟随光标（右固定）
+    }
+    if edges & RZ_RIGHT != 0 {
+        nr = r + dx;
+    }
+    if edges & RZ_TOP != 0 {
+        nt = tp + dy;
+    }
+    if edges & RZ_BOTTOM != 0 {
+        nb = b + dy;
+    }
+    // 最小尺寸钳制（拖过头时把活动边拉回，不动固定边）
+    if nr - nl < MIN_W {
+        if edges & RZ_LEFT != 0 {
+            nl = nr - MIN_W;
+        }
+        if edges & RZ_RIGHT != 0 {
+            nr = nl + MIN_W;
+        }
+    }
+    if nb - nt < MIN_H {
+        if edges & RZ_TOP != 0 {
+            nt = nb - MIN_H;
+        }
+        if edges & RZ_BOTTOM != 0 {
+            nb = nt + MIN_H;
+        }
+    }
+    (nl, nt, nr - nl, nb - nt)
+}
+
 /// 驱动状态机（`DragState` 的方法）。`resolve(x, y)` 由调用方（engine 线程）注入，
 /// 负责命中测试/排除表/身份解析/策略选择（winmod::resolve_target）。
 impl DragState {
@@ -114,6 +216,25 @@ impl DragState {
 
         match ev {
             EngineEvent::Down { x, y, mods } => {
+                // resize 路径（触发键组合 = `cfg.resize_mask`，默认 Alt+Ctrl；mask=0 关闭）：
+                // 组合键齐全 + 光标在目标框边带内 ⇒ 本手势提交为"调整大小"；
+                // 不贴边则**落到常规路径**（Alt 部分恰好齐全 ⇒ 仍可拖）。
+                // 单按 Alt（拖拽键）永远走常规路径，不触发 resize。
+                if cfg.resize_mask != 0 && *mods & cfg.resize_mask == cfg.resize_mask {
+                    if let Some(target) = resolve(*x, *y) {
+                        let edges = resize_edges_for(&target, *x, *y, cfg.edge_band_px);
+                        if edges != 0 {
+                            *self = DragState::ArmedResize {
+                                target,
+                                start: [*x, *y],
+                            };
+                            return vec![Action::None];
+                        }
+                    } else {
+                        *self = DragState::Idle;
+                        return vec![Action::None];
+                    }
+                }
                 // 规则 1：修饰不齐 → 忽略（不动状态）。
                 if !mods_ok(*mods) {
                     return vec![Action::None];
@@ -218,6 +339,51 @@ impl DragState {
                         }],
                         None,
                     ),
+                    // resize 提交前：达阈值才提交（边掩码在提交时按 Down 位置重算，
+                    // 与 Down 时刻判定必然一致）。
+                    DragState::ArmedResize { target, start } => {
+                        let th = cfg.threshold_px as i64;
+                        if *mods & cfg.resize_mask != cfg.resize_mask {
+                            // 修饰不齐（松开触发键）→ 本事件无动作、状态保留（与移动路径同语义）。
+                            (vec![Action::None], None)
+                        } else if dist_sq([*x, *y], *start) < th * th {
+                            (vec![Action::None], None)
+                        } else {
+                            let edges = resize_edges_for(target, start[0], start[1], cfg.edge_band_px);
+                            let (rx, ry, rw, rh) = resize_rect(target, *start, edges, *x, *y);
+                            (
+                                vec![
+                                    Action::SetRect {
+                                        x: rx,
+                                        y: ry,
+                                        w: rw,
+                                        h: rh,
+                                        edges,
+                                    },
+                                    Action::End,
+                                ],
+                                Some(DragState::Resize {
+                                    target: target.clone(),
+                                    start: *start,
+                                    edges,
+                                }),
+                            )
+                        }
+                    }
+                    // 已提交的 resize：每 Move 一条 SetRect（相对 start 累计）。
+                    DragState::Resize { target, start, edges } => {
+                        let (rx, ry, rw, rh) = resize_rect(target, *start, *edges, *x, *y);
+                        (
+                            vec![Action::SetRect {
+                                x: rx,
+                                y: ry,
+                                w: rw,
+                                h: rh,
+                                edges: *edges,
+                            }],
+                            None,
+                        )
+                    }
                     // 规则 4 的 Native 侧：拖动循环在目标应用内部，状态机无动作。
                     _ => (vec![Action::None], None),
                 };
@@ -235,7 +401,8 @@ impl DragState {
             // 生产手势下杀死双击；此处按"Up 结束本 click 相位、保留双击记忆"实现，
             // GOAL 示例测试（连续 Down/Down）与此语义兼容）。
             EngineEvent::Up { .. } => {
-                let keep_armed = matches!(self, DragState::Armed { .. });
+                let keep_armed =
+                    matches!(self, DragState::Armed { .. } | DragState::ArmedResize { .. });
                 if !keep_armed {
                     *self = DragState::Idle;
                 }
@@ -254,12 +421,16 @@ mod tests {
     const CTRL_BIT: u32 = 1u32 << 17;
 
     impl EngineCfg {
-        /// 测试固定配置：Alt 触发、阈值 5px、双击窗 500ms。
+        /// 测试固定配置：Alt 触发、阈值 5px、双击窗 500ms、resize 路径关闭
+        /// （`resize_mask=0` ⇒ GOAL 原示例测试逐字不变；resize 专项测试用
+        /// `cfg_resize()` 打开 Ctrl 路径）。
         pub fn test() -> Self {
             Self {
                 modifiers_mask: MOD_ALT,
                 threshold_px: 5,
                 double_click_ms: 500,
+                resize_mask: 0,
+                edge_band_px: 10,
             }
         }
     }
@@ -487,5 +658,150 @@ mod tests {
         s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg); // → Native
         assert_eq!(s.feed(&move_(110, 200, MOD_ALT), &resolve_ok(false), &cfg), vec![Action::None]);
         assert!(matches!(s, DragState::Native { .. }));
+    }
+
+    // ===== resize（独立触发键 Ctrl = bit17；边带 10px）=====
+
+    fn target_rz() -> Target {
+        // frame [100,100,500,400]（400×300），非最大化，Fallback。
+        Target {
+            hwnd: 0x77,
+            exe: "notepad.exe".into(),
+            frame: [100, 100, 500, 400],
+            is_maximized: false,
+            strategy: Strategy::Fallback,
+        }
+    }
+    fn resolve_rz() -> impl Fn(i32, i32) -> Option<Target> {
+        move |_, _| Some(target_rz())
+    }
+    fn cfg_resize() -> EngineCfg {
+        let mut c = EngineCfg::test();
+        c.resize_mask = CTRL_BIT;
+        c.edge_band_px = 10;
+        c
+    }
+
+    #[test]
+    fn resize_right_edge_grows() {
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        assert_eq!(
+            s.feed(&down(496, 250, CTRL_BIT), &resolve_rz(), &cfg),
+            vec![Action::None]
+        );
+        assert!(matches!(s, DragState::ArmedResize { .. }));
+        let a = s.feed(&move_(516, 250, CTRL_BIT), &resolve_rz(), &cfg); // dx=+20 ≥ 5
+        assert_eq!(
+            a,
+            vec![
+                Action::SetRect {
+                    x: 100,
+                    y: 100,
+                    w: 420,
+                    h: 300,
+                    edges: RZ_RIGHT
+                },
+                Action::End
+            ]
+        );
+        assert!(matches!(s, DragState::Resize { .. }));
+        // 后续 Move 仍相对 start(496,250) 累计：dx=+40。
+        let a2 = s.feed(&move_(536, 250, CTRL_BIT), &resolve_rz(), &cfg);
+        assert_eq!(
+            a2,
+            vec![Action::SetRect {
+                x: 100,
+                y: 100,
+                w: 440,
+                h: 300,
+                edges: RZ_RIGHT
+            }]
+        );
+    }
+
+    #[test]
+    fn resize_left_edge_min_clamp() {
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        s.feed(&down(104, 250, CTRL_BIT), &resolve_rz(), &cfg); // 左边（|104-100|=4 ≤ 10）
+        // 拖到宽度将低于 MIN_W(100) → 活动边（左）钳回，右固定。
+        let a = s.feed(&move_(414, 250, CTRL_BIT), &resolve_rz(), &cfg); // dx=+310 → nl=410, w=90
+        assert_eq!(
+            a,
+            vec![
+                Action::SetRect {
+                    x: 400,
+                    y: 100,
+                    w: 100,
+                    h: 300,
+                    edges: RZ_LEFT
+                },
+                Action::End
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_corner_bottomright() {
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        s.feed(&down(496, 396, CTRL_BIT), &resolve_rz(), &cfg);
+        let a = s.feed(&move_(526, 416, CTRL_BIT), &resolve_rz(), &cfg); // dx=+30, dy=+20
+        assert_eq!(
+            a,
+            vec![
+                Action::SetRect {
+                    x: 100,
+                    y: 100,
+                    w: 430,
+                    h: 320,
+                    edges: RZ_RIGHT | RZ_BOTTOM
+                },
+                Action::End
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_client_click_is_noop() {
+        // Ctrl + 客户端区（不贴边）→ 无事发生（规则：resize 只在框边带内生效）。
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        assert_eq!(s.feed(&down(300, 250, CTRL_BIT), &resolve_rz(), &cfg), vec![Action::None]);
+        assert!(matches!(s, DragState::Idle));
+    }
+
+    #[test]
+    fn resize_both_mods_edge_wins() {
+        // 两键同按（Alt+Ctrl）且贴边 → resize 优先于拖动（更特定的意图）。
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        s.feed(&down(496, 250, MOD_ALT | CTRL_BIT), &resolve_rz(), &cfg);
+        assert!(matches!(s, DragState::ArmedResize { .. }));
+    }
+
+    #[test]
+    fn resize_maximized_window_noop() {
+        // 最大化窗：边带无效（OS 语义不可 resize）→ Ctrl+贴边点击 = 无动作。
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        let resolve = |_: i32, _: i32| Some(Target {
+            is_maximized: true,
+            ..target_rz()
+        });
+        s.feed(&down(496, 250, CTRL_BIT), &resolve, &cfg);
+        assert!(matches!(s, DragState::Idle));
+    }
+
+    #[test]
+    fn alt_double_click_at_edge_still_maximizes() {
+        // 回归守卫：Alt 路径不受 resize 影响——贴边 Alt 双击仍发 Maximize
+        // （resize 是独立触发键，不抢 Alt 手势）。
+        let mut s = DragState::Idle;
+        let cfg = cfg_resize();
+        s.feed(&down(496, 250, MOD_ALT), &resolve_rz(), &cfg);
+        let a = s.feed(&down(496, 250, MOD_ALT), &resolve_rz(), &cfg);
+        assert_eq!(a, vec![Action::Maximize, Action::End]);
     }
 }

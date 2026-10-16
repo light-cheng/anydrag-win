@@ -3,6 +3,13 @@
 .vscode/
 *.swp
 
+# ANYDRAG_DEBUG=1 的运行日志（冒烟诊断用，不入库）
+diag.log
+resize-diag.log
+
+# 工作区助手记忆（本地数据，不入库）
+.workbuddy-ai/
+
 
 # Added by cargo
 #
