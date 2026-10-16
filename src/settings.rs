@@ -12,7 +12,7 @@
 //!   所以它自己不会被手势拖动/缩放。
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 
 use windows_sys::core::PCWSTR;
@@ -25,20 +25,16 @@ use windows_sys::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Registry::{
-    RegGetValueW, HKEY, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
-};
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow, LoadCursorW, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BS_TYPEMASK,
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWL_STYLE, IDC_ARROW, SW_SHOW, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
-    WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowTextLengthW,
+    GetWindowTextW, IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
+    BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, IDC_ARROW, SW_SHOW, WM_CLOSE,
+    WM_COMMAND, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_SETFONT, WNDCLASSEXW,
+    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config;
@@ -60,11 +56,8 @@ static WIN: AtomicIsize = AtomicIsize::new(0);
 /// 底部灰色提示控件句柄（WM_CTLCOLORSTATIC 里给它上灰色文字）。
 static HINT_HWND: AtomicIsize = AtomicIsize::new(0);
 
-/// 系统是否深色模式（WM_CREATE 时读一次注册表缓存）。
-static IS_DARK: AtomicBool = AtomicBool::new(false);
-
 // ── Win11 DWM 现代窗口效果常量（未文档化但数十年稳定的属性 id）──
-/// DWMWA_USE_IMMERSIVE_DARK_MODE：深色标题栏（Win10 1809+）。
+/// DWMWA_USE_IMMERSIVE_DARK_MODE：标题栏明暗（Win10 1809+）。
 const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 /// DWMWA_WINDOW_CORNER_PREFERENCE：圆角窗口（Win11 22000+）。DWMWCP_ROUND = 2。
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
@@ -77,6 +70,10 @@ const DWMSBT_MAINWINDOW: u32 = 2;
 /// 自绘卡片取代 GROUPBOX：GROUPBOX 标题颜色改不了（主题引擎自绘，不吃
 /// WM_CTLCOLORSTATIC），且方角灰框没有现代感；自绘卡片在远程桌面下也稳定显示
 /// （不依赖 DWM Mica 材质转发）。
+///
+/// **锁浅色设计**：Win32 原生控件（EDIT/COMBO/CHECKBOX）不跟随系统深色，
+/// 硬跟深色会标题栏深/内容浅或反之的撕裂（2026-10-16 用户实测）。浅色卡片 +
+/// 系统浅色控件 + 浅色标题栏全套一致。深色要等全套自绘控件时再做。
 const CARDS: [(&str, i32, i32, i32, i32); 3] = [
     ("触发键", 12, 12, 596, 104),
     ("手势参数", 12, 128, 596, 188),
@@ -88,7 +85,6 @@ const CARDS: [(&str, i32, i32, i32, i32); 3] = [
 /// Win11 设置应用同款层次：浅灰窗口底 + 白色圆角卡片 + 蓝色半粗体卡片标题。
 /// 控件是 sibling 子窗口，绘制在背景之上，天然分层。
 unsafe fn paint_background(hwnd: HWND, hdc: HDC) {
-    let dark = IS_DARK.load(Ordering::Relaxed);
     let mut rc = std::mem::zeroed();
     GetClientRect(hwnd, &mut rc);
     let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
@@ -100,10 +96,11 @@ unsafe fn paint_background(hwnd: HWND, hdc: HDC) {
     let bmp = CreateCompatibleBitmap(hdc, w, h);
     let old_bmp = SelectObject(mem, bmp);
 
-    let bg = if dark { rgb(0x20, 0x20, 0x20) } else { rgb(0xF0, 0xF0, 0xF0) };
-    let card = if dark { rgb(0x2D, 0x2D, 0x2D) } else { rgb(0xFF, 0xFF, 0xFF) };
-    let border = if dark { rgb(0x3D, 0x3D, 0x3D) } else { rgb(0xE3, 0xE3, 0xE3) };
-    let title_c = if dark { rgb(0x6C, 0xB2, 0xFF) } else { rgb(0x2D, 0x7F, 0xF9) };
+    // 浅色卡片设计（锁定浅色，见 CARDS 注释）。
+    let bg = rgb(0xF0, 0xF0, 0xF0);
+    let card = rgb(0xFF, 0xFF, 0xFF);
+    let border = rgb(0xE3, 0xE3, 0xE3);
+    let title_c = rgb(0x2D, 0x7F, 0xF9);
 
     // 窗口底
     let bg_brush = CreateSolidBrush(bg);
@@ -168,34 +165,13 @@ unsafe fn paint_background(hwnd: HWND, hdc: HDC) {
     DeleteDC(mem);
 }
 
-/// 读注册表判断系统是否深色模式（AppsUseLightTheme = 0 → 深色）。
-/// 读不到按浅色处理（不拖累功能）。
-fn is_system_dark() -> bool {
-    unsafe {
-        let subkey = wstr("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-        let value = wstr("AppsUseLightTheme");
-        let mut data: u32 = 1;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let r = RegGetValueW(
-            HKEY_CURRENT_USER as HKEY,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            &mut data as *mut u32 as *mut _,
-            &mut size,
-        );
-        r == 0 && data == 0
-    }
-}
-
 /// 给窗口套上 Win11 现代效果（WM_CREATE 里调用，窗口已存在、尚未显示）。
 ///
-/// - Mica 云母背景：跟随系统明暗的毛玻璃材质（需 Win11 22621+；旧系统 DWM 会忽略）
+/// - Mica 云母背景（Win11 22621+；旧系统/远程桌面被 DWM 忽略时无副作用）
 /// - 圆角窗口（Win11 22000+）
-/// - 深色标题栏（Win10 1809+，跟随系统）
+/// - 标题栏固定浅色（与浅色卡片设计一致，锁浅色见 CARDS 注释）
 ///
-/// 配套 wnd_proc 的 WM_ERASEBKGND：不再擦背景，让 Mica 透到控件下面。
+/// 配套 wnd_proc 的 WM_ERASEBKGND：自绘卡片背景。
 unsafe fn apply_modern_window_style(hwnd: HWND) {
     let backdrop = DWMSBT_MAINWINDOW;
     DwmSetWindowAttribute(
@@ -211,30 +187,14 @@ unsafe fn apply_modern_window_style(hwnd: HWND) {
         &corner as *const u32 as *const _,
         std::mem::size_of::<u32>() as u32,
     );
-    let dark: u32 = if is_system_dark() { 1 } else { 0 };
+    // 标题栏固定浅色（0 = light），与整套浅色卡片一致。
+    let light: u32 = 0;
     DwmSetWindowAttribute(
         hwnd,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &dark as *const u32 as *const _,
+        &light as *const u32 as *const _,
         std::mem::size_of::<u32>() as u32,
     );
-    IS_DARK.store(dark != 0, Ordering::Release);
-}
-
-/// 该句柄是不是复选框/单选钮（BUTTON 类 + AUTOCHECKBOX/AUTORADIOBUTTON）。
-unsafe fn is_check_or_radio(h: HWND) -> bool {
-    let mut cls = [0u16; 32];
-    let n = GetClassNameW(h, cls.as_mut_ptr(), 32);
-    if n == 0 {
-        return false;
-    }
-    let end = cls.iter().position(|&c| c == 0).unwrap_or(cls.len());
-    let name = String::from_utf16_lossy(&cls[..end]);
-    // BS_* 常量在 windows-sys 0.61 里是 i32，先统一转 u32 再按位比较。
-    let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
-    name == "BUTTON"
-        && (style & BS_TYPEMASK as u32 == BS_AUTOCHECKBOX as u32
-            || style & BS_TYPEMASK as u32 == BS_AUTORADIOBUTTON as u32)
 }
 
 /// 控件句柄表。`HWND` 是裸指针（非 `Send`），放不进 `static Mutex`，故统一存 `isize`。
@@ -388,34 +348,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             HINT_HWND.store(0, Ordering::Release);
             0
         }
-        // 控件文字着色（跟随系统明暗；浅色模式保持默认黑字）：
-        // - 底部提示 → 灰色
-        // - 深色模式下其余 STATIC/复选框文字 → 白/浅灰（深色底上黑字不可见）
-        // 统一返回 NULL_BRUSH：文字背景透明，卡片材质透出。
+        // 控件文字着色（锁浅色，与整套浅色卡片一致）：
+        // - 底部提示 → 灰色；其余 STATIC 保持默认黑字
+        // 统一返回 NULL_BRUSH：文字背景透明，白色卡片透出。
         WM_CTLCOLORSTATIC => {
-            let dark = IS_DARK.load(Ordering::Relaxed);
             let target = lp as HWND;
             if target == HINT_HWND.load(Ordering::Acquire) as HWND {
-                SetTextColor(
-                    wp as HDC,
-                    if dark {
-                        rgb(0xA0, 0xA0, 0xA0)
-                    } else {
-                        rgb(0x5A, 0x5A, 0x5A)
-                    },
-                );
-            } else if dark {
-                SetTextColor(wp as HDC, rgb(0xE8, 0xE8, 0xE8));
+                SetTextColor(wp as HDC, rgb(0x5A, 0x5A, 0x5A));
             }
             GetStockObject(NULL_BRUSH) as isize
-        }
-        // 复选框/单选钮文字（深色模式上白色）；普通按钮由视觉样式自绘，不动。
-        WM_CTLCOLORBTN => {
-            if IS_DARK.load(Ordering::Relaxed) && is_check_or_radio(lp as HWND) {
-                SetTextColor(wp as HDC, rgb(0xE8, 0xE8, 0xE8));
-                return GetStockObject(NULL_BRUSH) as isize;
-            }
-            DefWindowProcW(hwnd, msg, wp, lp)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
