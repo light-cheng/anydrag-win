@@ -19,7 +19,10 @@ use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    GetStockObject, SetTextColor, DEFAULT_GUI_FONT, HDC, NULL_BRUSH,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, FillRect, GetStockObject, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, TextOutW, DEFAULT_GUI_FONT, HDC, HFONT, LOGFONTW, NULL_BRUSH, PS_SOLID, SRCCOPY,
+    TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
@@ -27,15 +30,15 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, IsWindow, LoadCursorW, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, BS_TYPEMASK, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
-    ES_MULTILINE, ES_WANTRETURN, GWL_STYLE, IDC_ARROW, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_SETFONT,
-    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED,
-    WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsWindow, LoadCursorW, RegisterClassExW,
+    SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
+    BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BS_TYPEMASK,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT, ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GWL_STYLE, IDC_ARROW, SW_SHOW, WM_CLOSE,
+    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND,
+    WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config;
@@ -69,6 +72,101 @@ const DWMWCP_ROUND: u32 = 2;
 /// DWMWA_SYSTEMBACKDROP_TYPE：系统背景材质（Win11 22621+）。DWMSBT_MAINWINDOW = 2（Mica）。
 const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
 const DWMSBT_MAINWINDOW: u32 = 2;
+
+/// 卡片区域（96dpi 基准坐标，与 create_controls 的布局一一对应）+ 标题。
+/// 自绘卡片取代 GROUPBOX：GROUPBOX 标题颜色改不了（主题引擎自绘，不吃
+/// WM_CTLCOLORSTATIC），且方角灰框没有现代感；自绘卡片在远程桌面下也稳定显示
+/// （不依赖 DWM Mica 材质转发）。
+const CARDS: [(&str, i32, i32, i32, i32); 3] = [
+    ("触发键", 12, 12, 596, 104),
+    ("手势参数", 12, 128, 596, 188),
+    ("进程名单（一行一个，小写）", 12, 328, 596, 256),
+];
+
+/// 双缓冲自绘窗口背景（WM_ERASEBKGND 调用）。
+///
+/// Win11 设置应用同款层次：浅灰窗口底 + 白色圆角卡片 + 蓝色半粗体卡片标题。
+/// 控件是 sibling 子窗口，绘制在背景之上，天然分层。
+unsafe fn paint_background(hwnd: HWND, hdc: HDC) {
+    let dark = IS_DARK.load(Ordering::Relaxed);
+    let mut rc = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    // 内存 DC 双缓冲，避免闪烁。
+    let mem = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, w, h);
+    let old_bmp = SelectObject(mem, bmp);
+
+    let bg = if dark { rgb(0x20, 0x20, 0x20) } else { rgb(0xF0, 0xF0, 0xF0) };
+    let card = if dark { rgb(0x2D, 0x2D, 0x2D) } else { rgb(0xFF, 0xFF, 0xFF) };
+    let border = if dark { rgb(0x3D, 0x3D, 0x3D) } else { rgb(0xE3, 0xE3, 0xE3) };
+    let title_c = if dark { rgb(0x6C, 0xB2, 0xFF) } else { rgb(0x2D, 0x7F, 0xF9) };
+
+    // 窗口底
+    let bg_brush = CreateSolidBrush(bg);
+    FillRect(mem, &rc, bg_brush);
+    DeleteObject(bg_brush);
+
+    let dpi = GetDpiForSystem().max(96) as i32;
+    let s = |v: i32| v * dpi / 96;
+
+    // 卡片标题字体：Segoe UI 半粗体（比正文大一级，形成层级）。
+    let mut lf: LOGFONTW = std::mem::zeroed();
+    lf.lfHeight = -s(15);
+    lf.lfWeight = 600; // FW_SEMIBOLD
+    lf.lfCharSet = 1; // DEFAULT_CHARSET
+    let face = "Segoe UI".encode_utf16().chain(std::iter::once(0));
+    for (i, c) in face.enumerate().take(32) {
+        lf.lfFaceName[i] = c;
+    }
+    let title_font: HFONT = CreateFontW(
+        lf.lfHeight,
+        lf.lfWidth,
+        lf.lfEscapement,
+        lf.lfOrientation,
+        lf.lfWeight,
+        0,
+        0,
+        0,
+        lf.lfCharSet as u32,
+        0,
+        0,
+        0,
+        0,
+        lf.lfFaceName.as_ptr(),
+    );
+    let old_font = SelectObject(mem, title_font);
+    SetBkMode(mem, TRANSPARENT as i32);
+    SetTextColor(mem, title_c);
+
+    for (title, x, y, cw, ch) in CARDS {
+        let (l, t, r, b) = (s(x), s(y), s(x + cw), s(y + ch));
+        // 圆角卡片（白/深卡 + 细边框）
+        let card_brush = CreateSolidBrush(card);
+        let border_pen = CreatePen(PS_SOLID, 1, border);
+        let old_brush = SelectObject(mem, card_brush);
+        let old_pen = SelectObject(mem, border_pen);
+        RoundRect(mem, l, t, r, b, s(24), s(24));
+        SelectObject(mem, old_brush);
+        SelectObject(mem, old_pen);
+        DeleteObject(card_brush);
+        DeleteObject(border_pen);
+        // 卡片标题（左上内缩）
+        let tw = wstr(title);
+        TextOutW(mem, l + s(18), t + s(9), tw.as_ptr(), tw.len() as i32 - 1);
+    }
+
+    SelectObject(mem, old_font);
+    DeleteObject(title_font);
+
+    BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
 
 /// 读注册表判断系统是否深色模式（AppsUseLightTheme = 0 → 深色）。
 /// 读不到按浅色处理（不拖累功能）。
@@ -123,20 +221,6 @@ unsafe fn apply_modern_window_style(hwnd: HWND) {
     IS_DARK.store(dark != 0, Ordering::Release);
 }
 
-/// 该句柄是不是分组框（BUTTON 类 + BS_GROUPBOX 风格）——用于标题着色。
-unsafe fn is_groupbox(h: HWND) -> bool {
-    let mut cls = [0u16; 32];
-    let n = GetClassNameW(h, cls.as_mut_ptr(), 32);
-    if n == 0 {
-        return false;
-    }
-    let end = cls.iter().position(|&c| c == 0).unwrap_or(cls.len());
-    let name = String::from_utf16_lossy(&cls[..end]);
-    // BS_* 常量在 windows-sys 0.61 里是 i32，先统一转 u32 再按位比较。
-    let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
-    name == "BUTTON" && style & BS_TYPEMASK as u32 == BS_GROUPBOX as u32
-}
-
 /// 该句柄是不是复选框/单选钮（BUTTON 类 + AUTOCHECKBOX/AUTORADIOBUTTON）。
 unsafe fn is_check_or_radio(h: HWND) -> bool {
     let mut cls = [0u16; 32];
@@ -146,6 +230,7 @@ unsafe fn is_check_or_radio(h: HWND) -> bool {
     }
     let end = cls.iter().position(|&c| c == 0).unwrap_or(cls.len());
     let name = String::from_utf16_lossy(&cls[..end]);
+    // BS_* 常量在 windows-sys 0.61 里是 i32，先统一转 u32 再按位比较。
     let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
     name == "BUTTON"
         && (style & BS_TYPEMASK as u32 == BS_AUTOCHECKBOX as u32
@@ -244,7 +329,10 @@ pub fn open() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             s(620),
-            s(660),
+            // 注意：CreateWindowExW 的宽高是**含标题栏+边框的整个窗口**尺寸，
+            // 不是客户区。布局内容底边（按钮行 636）+ 非客户区(~40@150%) + 底边距
+            // → 700 基准（150% 下 1050px 总高）。660 会把按钮裁掉一半。
+            s(700),
             0 as HWND,
             0 as _,
             instance,
@@ -270,8 +358,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             create_controls(hwnd);
             0
         }
-        // 不擦背景：让 DWM 画的 Mica 透到控件下面（擦背景会盖住材质）。
-        WM_ERASEBKGND => 1,
+        // 自绘卡片式背景（浅灰底 + 白圆角卡片 + 蓝色标题），不依赖 Mica 是否生效。
+        WM_ERASEBKGND => {
+            paint_background(hwnd, wp as HDC);
+            1
+        }
         WM_COMMAND => {
             match wp & 0xFFFF {
                 ID_SAVE => {
@@ -298,23 +389,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             0
         }
         // 控件文字着色（跟随系统明暗；浅色模式保持默认黑字）：
-        // - 分组框标题 → 主题蓝（与托盘/图标同色 #2D7FF9，深色下提亮）
         // - 底部提示 → 灰色
-        // - 深色模式下其余 STATIC/复选框文字 → 白/浅灰（Mica 深色底上黑字不可见）
-        // 统一返回 NULL_BRUSH：文字背景透明，Mica 材质透出。
+        // - 深色模式下其余 STATIC/复选框文字 → 白/浅灰（深色底上黑字不可见）
+        // 统一返回 NULL_BRUSH：文字背景透明，卡片材质透出。
         WM_CTLCOLORSTATIC => {
             let dark = IS_DARK.load(Ordering::Relaxed);
             let target = lp as HWND;
-            if is_groupbox(target) {
-                SetTextColor(
-                    wp as HDC,
-                    if dark {
-                        rgb(0x6C, 0xB2, 0xFF)
-                    } else {
-                        rgb(0x2D, 0x7F, 0xF9)
-                    },
-                );
-            } else if target == HINT_HWND.load(Ordering::Acquire) as HWND {
+            if target == HINT_HWND.load(Ordering::Acquire) as HWND {
                 SetTextColor(
                     wp as HDC,
                     if dark {
@@ -420,14 +501,9 @@ unsafe fn create_controls(parent: HWND) {
             0,
         )
     };
-    let group = |title: &str, x: i32, y: i32, w: i32, h: i32| {
-        mk("BUTTON", title, BS_GROUPBOX as u32, 0, x, y, w, h, 0);
-    };
-
     let mut c = ZERO;
 
-    // ── 分组一：触发键 ──────────────────────────────
-    group("触发键", 12, 12, 596, 104);
+    // ── 卡片一：触发键（卡片框与标题由 paint_background 自绘，见 CARDS）──
     label("拖动 / 双击：", 30, 42, 110);
     c.drag_alt = check("Alt", 150, 40, 64);
     c.drag_ctrl = check("Ctrl", 218, 40, 64);
@@ -439,8 +515,7 @@ unsafe fn create_controls(parent: HWND) {
     c.rz_shift = check("Shift", 290, 78, 68);
     c.rz_win = check("Win", 362, 78, 64);
 
-    // ── 分组二：手势参数 ────────────────────────────
-    group("手势参数", 12, 128, 596, 188);
+    // ── 卡片二：手势参数 ────────────────────────────
     label("拖动阈值（像素）", 30, 160, 200);
     c.thr = edit1(240, 158, 90);
     label("双击间隔（毫秒，留空 = 跟随系统）", 30, 198, 280);
@@ -462,8 +537,7 @@ unsafe fn create_controls(parent: HWND) {
         0,
     );
 
-    // ── 分组三：进程名单（一行一个，小写）────────────
-    group("进程名单（一行一个，小写）", 12, 328, 596, 256);
+    // ── 卡片三：进程名单 ────────────────────────────
     label("完全无视手势的进程：", 30, 358, 300);
     c.excl = editn(30, 384, 560, 76);
     label("强制走 fallback 通道的进程：", 30, 476, 300);
