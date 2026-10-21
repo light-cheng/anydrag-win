@@ -1,0 +1,7 @@
+// 应用图标资源。
+// 用 rc.exe 编译成 .res，再由 build.rs 通过 cargo:rustc-link-arg 链进 exe。
+// IDI_ICON1 = 32512，Windows 用这个 ID 作为"应用图标"（Explorer/任务栏/Alt+Tab）。
+
+#include <winres.h>
+
+IDI_ICON1 ICON "anydrag-win.ico"
