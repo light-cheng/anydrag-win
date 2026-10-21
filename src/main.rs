@@ -2,6 +2,15 @@
 //! main（DPI 感知 + 托盘泵）/ engine（ring 消费 + 状态机 + FFI 动作）/
 //! hook（WH_MOUSE_LL，O(1) 回调塞 ring + PostThreadMessage）。
 
+// **GUI 子系统**（2026-10-21 修复）：不加这行时 Rust 默认编成 CONSOLE 子系统
+// （PE Subsystem=3），双击启动会弹出一个黑框终端窗口。这是个纯托盘程序，不该有它——
+// 更严重的是：**关掉那个窗口 = 向本进程的控制台发 CTRL_CLOSE_EVENT = 程序直接被杀**，
+// 用户很容易误以为"程序崩了"。
+//
+// 换成 WINDOWS 子系统后进程不再附带控制台，但 `eprintln!` 仍有出路（见 `attach_debug_console`）：
+// 从 cmd/PowerShell 启动时继承父控制台，`ANYDRAG_DEBUG=1` 的诊断日志照常可见。
+#![windows_subsystem = "windows"]
+
 mod coalesce;
 mod config;
 mod engine;

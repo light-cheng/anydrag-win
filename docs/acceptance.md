@@ -345,3 +345,20 @@ alt 最大化（有效），alt+ctrl 缩放（失效）"。
 
 **回归**：`cargo test` **53/53 全绿**（新增 `coalesce` 6 条）。400 轮风暴（16000 次注入）
 后 `alt-drag` / `ctrl-resize` / `alt-dbl` / `middle-snap` 四项仍全 PASS。
+
+---
+
+## 缺陷 6：双击启动弹出黑框终端窗口，关掉它程序就死（2026-10-21）
+
+**现象**：用户双击 exe 启动时总有一个终端窗口跟着出现。
+
+**根因**：Cargo.toml 从未声明子系统，Rust 默认编成 CONSOLE 子系统（PE Subsystem = 3）。
+而且这不只是多一个窗口：**关掉它 = 系统发 CTRL_CLOSE_EVENT = 进程直接被杀**。
+
+**修复**：src/main.rs 加 `#![windows_subsystem = "windows"]`，产物变为 Subsystem = 2（GUI），双击启动干净无窗口。
+
+**诊断能力必须保住**（修复的主要风险点）：全部诊断输出走 `eprintln!`，而 GUI 子系统进程默认没有控制台。实测两种场景都正常：
+- cmd/PowerShell 启动 + `2> log` 重定向：日志正常写入（实测 `[tray] NIM_ADD ok`）
+- 完全无控制台（DETACHED_PROCESS + CREATE_NO_WINDOW）+ ANYDRAG_DEBUG=1：进程存活，不 panic
+
+第二项必须验证：Rust 的 `eprintln!` 写 stderr 失败时 `panic_on_failure = true`，若不实测就改成 GUI 子系统，可能引入开了 debug 就崩的回归。
