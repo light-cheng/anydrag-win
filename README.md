@@ -113,10 +113,18 @@ target\release\anydrag-win.exe
 ## 开发
 
 ```bash
-cargo test            # 38 个单测（纯逻辑模块 ring/mods/engine/config/icon 零 windows-sys）
+cargo test            # 53 个单测（纯逻辑模块 ring/mods/engine/config/icon/coalesce/throttle 零 windows-sys）
 cmd /c "build.bat"     # release 构建
 ```
 
 冒烟驱动：`target/release/probe_gesture.exe`（`frame|alt-drag|alt-dbl|ctrl-resize|middle-snap|maximize|send-save|close`，
 自动化验收用，非用户工具；跑之前它会先确认目标窗在最前，否则直接中止，避免误伤别的窗口）。
-诊断日志：`ANYDRAG_DEBUG=1` 运行时打印到 stderr。
+诊断日志：`ANYDRAG_DEBUG=1` 运行时打印到 stderr（GUI 子系统下从 cmd 启动仍可见；
+心跳行含 `dropped=` 与 `state=`，是判断事件环溢出/状态滞留的第一手指标）。
+
+### 图标
+
+- **托盘图标**：运行时自绘（`src/icon.rs`），不依赖资源文件；配色即状态（蓝=启用，灰=禁用）。
+- **exe 文件图标**：内嵌进 PE 资源段（`assets/anydrag-win.ico` + `assets/app.rc`）。
+  `build.rs` 调 Windows SDK 的 `rc.exe` 编译后经 `cargo:rustc-link-arg` 交给链接器，
+  **不引入任何 Rust 构建依赖**（不用 winres/embed-resource）。找不到 rc.exe 只警告不失败。
