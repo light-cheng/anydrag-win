@@ -10,6 +10,7 @@ mod icon;
 mod mods;
 mod ring;
 mod settings;
+mod throttle;
 mod tray;
 mod winmod;
 

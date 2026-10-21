@@ -242,7 +242,7 @@ let icon = LoadImageW(instance, IDI_APPLICATION, IMAGE_ICON, 0, 0, LR_DEFAULTSIZ
    而目标应用只能消化约 100 次/秒 → 它的消息队列越堆越多，窗口永远追不上光标，
    且末尾几次干脆没落地（所以最终宽度差 18px）。
    对策：几何更新**节流到显示器刷新周期**（`winmod::refresh_interval_ms`，实测该屏 120Hz
-   → 8ms），并加**背压**（上一次请求没落地就不发下一次，`engine_loop::caught_up`）。
+   → 8ms），并加**背压**（上一次请求没落地就不发下一次，决策在 `throttle::Throttle`）。
    中间态直接丢弃——每次下发的都是**绝对**几何，不累积误差。AltSnap 的
    `conf.RefreshRate`（`ASleep(RefreshRate)`，注释 "Accurate!!!"）是同一招。
 2. **坐标语义搞错了**：engine 算出的目标矩形是 **DWM 帧**
@@ -254,3 +254,57 @@ let icon = LoadImageW(instance, IDI_APPLICATION, IMAGE_ICON, 0, 0, LR_DEFAULTSIZ
 
 **回归**：`cargo test` 38/38 全绿；alt-drag / alt-dbl / ctrl-resize / middle-snap 四项全 PASS。
 
+
+---
+
+## 事故 5：快速反复缩放后拖拽/缩放全灭，只剩最大化可用（2026-10-21）
+
+**用户报障原文**："在 alt+ctrl 快速缩放多次后，功能会失效，重新尝试 alt 拖拽（失效），
+alt 最大化（有效），alt+ctrl 缩放（失效）"。
+
+**根因：背压是硬闩锁，一次不匹配就永久锁死。**
+旧 `engine_loop` 把"目标是否已追上"实现成：`caught_up(req, hwnd)` 比较
+`GetWindowRect(hwnd)` 与上一次**请求**的矩形 `req`，不等即推迟；而 `req` **只在成功
+下发时更新** ⇒ 一旦两者出现无法消除的差异，`caught_up` 永远为假，此后每一次
+拖拽/缩放都被推迟到"目标追上"这个永不到来的时刻。`MAX_RETRY_ROUNDS` 用尽后只是
+丢弃本帧、闩锁**依旧存在** ⇒ 功能永久失效。
+
+这个差异极易产生：应用按自己的最小尺寸钳制（`WM_GETMINMAXINFO`）、DPI 取整、
+尺寸调整相位中的临时几何、**以及切换到另一个窗口**（旧 `req` 属于旧窗口，却拿新窗口
+的矩形去比）。用户"快速缩放多次"正是在反复制造这种差异，所以越快点越容易中招。
+
+**为什么"只有最大化还好使"**：最大化/还原与中键分屏走 `SetWindowPlacement`
+（`winmod::set_placement_max_restore` / `snap_to_zone`），**完全不经过**几何下发路径，
+因此不受闩锁影响——这个症状指纹本身就指向了背压状态机。
+
+**修复**（背压从"硬闩锁"改成"软背压"，逻辑抽到纯模块 `src/throttle.rs`）：
+
+1. **绑定目标窗口**：`req` 存 `(hwnd, 矩形)`，只有**同一窗口**才做追上判断；
+   换了目标窗口 = 旧请求与本帧无关，不拦。
+2. **手势边界清闩锁**：`Down` / `Up` 时 `Throttle::reset()`，陈旧请求绝不跨手势存活；
+   `Down` 还顺手丢弃上一手势遗留的 `pending` + 定时器（否则定时器会在新手势里
+   把旧窗口的矩形放炮）。
+3. **等太久就强制下发**：`throttle::FORCE_AFTER_MS`（40ms ≈ 120Hz 下 5 帧）兜底，
+   把"永久死锁"退化成"每 40ms 下发一次最新几何"（= 无背压时的行为，可接受）。
+   正常情况 1-2 帧就追上，这个上限不会触发。
+4. **`Up` 先补发 `pending` 再清闩锁**：收尾那一帧的目标矩形只存在于 `pending`
+   （`Fallback`/`Resize` 态的 `Up` 不产出 `SetPos`/`SetRect`），先清会把用户松手时的
+   最终位置丢掉，窗口停在中途尺寸。
+5. 顺带把 `SetTimer` 的武装收进 `arm_timer()`（继续守住"同一时刻最多一个定时器"）。
+
+**回归测试**：新增 `throttle` 模块 10 条单测（含
+`never_catching_up_is_forced_after_deadline`、`stale_request_for_other_window_does_not_block`、
+`reset_clears_every_latch`），`cargo test` **47/47 全绿**。
+
+**真机对照实验**（同一台机、同一 notepad、同一注入脚本，旧构建 = `ad41aba`）：
+
+| 步骤 | 旧构建 ad41aba | 新构建 |
+|---|---|---|
+| 连做 10 次 `resize-bench`（末尾两次撞屏幕右边界） | 最后两次 `w_final` 卡在 2892 | 同左（窗口已达屏幕宽，属预期） |
+| 随后 `alt-drag` | **FAIL**（dx=0 dy=0） | **PASS**（dx=87） |
+| 随后 `ctrl-resize` | **FAIL**（w0=w1=1336） | **PASS**（+80px） |
+| 随后 `alt-dbl` | PASS | PASS |
+| 随后 `middle-snap` | PASS | PASS |
+
+**症状指纹与用户报障逐项吻合**（旧版：拖拽 FAIL / 缩放 FAIL / 最大化 PASS），
+修复后四项全 PASS。

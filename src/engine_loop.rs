@@ -26,6 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::{self, Config, ENABLED};
 use crate::engine::{Action, DragState, EngineCfg, EngineEvent};
 use crate::hook;
+use crate::throttle::{Decision, Geom, Throttle};
 use crate::winmod;
 
 /// 开 engine 线程（内部 spawn hook 线程并绑定本线程 tid），返回 engine 线程 tid。
@@ -49,7 +50,7 @@ pub fn run_in_thread(cfg: Arc<Config>) -> u32 {
     tid
 }
 
-/// 待落地的几何更新（节流用）。
+/// 节流 + 背压的决策逻辑在 `throttle` 模块（纯逻辑、可单测）。
 ///
 /// **为什么节流（2026-10-16 缩放延迟的根因，实测数据）**：对 Edge（4000 个卡片的页面）
 /// 以约 160 次/秒灌缩放请求时，窗口在最后一次鼠标移动之后**还在继续变化 314ms**，
@@ -58,16 +59,8 @@ pub fn run_in_thread(cfg: Arc<Config>) -> u32 {
 /// 移动之所以顺滑，是因为移动只让窗口管理器挪一下表面、应用几乎不干活。
 /// 对策：几何更新节流到显示器刷新周期，中间态直接丢掉——每次下发的都是**绝对**几何
 /// （`start + 位移`），丢掉中间帧不会累积误差。AltSnap 的 `conf.RefreshRate` 是同一招。
-#[derive(Clone, Copy, Debug)]
-enum Geom {
-    Pos { x: i32, y: i32 },
-    Rect { x: i32, y: i32, w: i32, h: i32 },
-}
-
-/// 重试轮数上限：目标长期追不上（最小尺寸钳制 / 窗口已最小化 / 应用不重排）时
-/// 放弃本帧——几何是绝对的、不累积误差，下一次事件或收尾 Up 会重发。
-const MAX_RETRY_ROUNDS: u32 = 400;
-
+///
+/// 背压见 `throttle` 模块注释（2026-10-21 硬闩锁死锁事故）。
 /// 下发一次几何更新，返回**本次请求的窗口矩形**（供背压判断"目标是否已追上"）。
 ///
 /// 缩放路径这里还做了一次**坐标语义换算**：engine 算出的目标矩形是 **DWM 帧**
@@ -108,7 +101,7 @@ pub fn run(cfg: Arc<Config>) {
     // 这里检测到变化就刷新快照并同步钩子的监视键列表 —— 即"改完即时生效"。
     let mut live: Config = (*cfg).clone();
     let mut live_ver = config::version();
-    // 几何节流/背压状态（见 `Geom` 注释）。
+    // 几何节流/背压状态（决策逻辑在 `throttle`，这里只做 I/O）。
     //
     // **线程定时器（SetTimer(NULL,…)）的 nIDEvent 参数会被系统忽略，返回值才是
     // KillTimer 要用的 ID**——2026-10-20 冻结事故根因：旧代码用固定常量 ID 反复
@@ -117,14 +110,11 @@ pub fn run(cfg: Arc<Config>) {
     // WM_TIMER 灌满（心跳仪实测 24 万条/秒且持续增长）→ 100% CPU 空转、真实事件
     // 饿死 → "程序整个卡死"且手势结束后**永久持续**（定时器杀不掉）。
     // 修复三件套：① 存返回值按真 ID 拆弹；② timer_id.is_none() 才武装（同一时刻
-    // 最多一个，它自己会在到点时重挂）；③ MAX_RETRY_ROUNDS 兜底放弃本帧。
+    // 最多一个，它自己会在到点时重挂）；③ 推迟有上限（`throttle::FORCE_AFTER_MS`）。
     let frame_ms = winmod::refresh_interval_ms();
+    let mut throttle = Throttle::new(frame_ms);
     let mut pending: Option<(Geom, Option<isize>)> = None;
-    let mut last_apply: Option<std::time::Instant> = None;
-    // 上一次**请求**的窗口矩形：用于判断目标应用是否已经把它落地了。
-    let mut req: Option<[i32; 4]> = None;
     let mut timer_id: Option<usize> = None;
-    let mut retry_rounds: u32 = 0;
     let mut msg: _ = unsafe { core::mem::zeroed() };
     // 心跳仪（仅 ANYDRAG_DEBUG）：按消息类型计数，每秒一条——诊断"CPU 空转但
     // 无日志"用。哪一类在暴涨，洪水就是谁灌的（2026-10-20 冻结事故现场工具）。
@@ -168,24 +158,28 @@ pub fn run(cfg: Arc<Config>) {
                 unsafe { KillTimer(std::ptr::null_mut(), id) };
             }
             if let Some((g, h)) = pending.take() {
-                if caught_up(req, h) {
-                    req = apply_geom(g, h);
-                    last_apply = Some(std::time::Instant::now());
-                    retry_rounds = 0;
-                } else if retry_rounds < MAX_RETRY_ROUNDS {
-                    // 还没追上：继续等，但计一轮（超上限就放弃本帧，见常量注释）
-                    pending = Some((g, h));
-                    retry_rounds += 1;
-                    if timer_id.is_none() {
-                        let id =
-                            unsafe { SetTimer(std::ptr::null_mut(), 0, frame_ms as u32, None) };
-                        if id != 0 {
-                            timer_id = Some(id as usize);
-                        }
+                let now = std::time::Instant::now();
+                // 只有"同一窗口、尚未落地"时才值得花一次 GetWindowRect。
+                let current = if throttle.outstanding(h) {
+                    h.and_then(winmod::window_rect)
+                } else {
+                    None
+                };
+                // 定时器到点是"重试节拍"，**不是**强制放行：目标还没追上就再等一轮。
+                // 真正的兜底在 `throttle::FORCE_AFTER_MS`——等太久它自己会返回 Apply，
+                // 因此这里绝不会无限循环。
+                match throttle.decide(now, h, current, false) {
+                    Decision::Apply => {
+                        let req = apply_geom(g, h);
+                        throttle.commit(now, h, req);
+                    }
+                    Decision::Defer => {
+                        // 目标还没追上：留着下轮再试（`FORCE_AFTER_MS` 保证有尽头）。
+                        throttle.note_deferred(now);
+                        pending = Some((g, h));
+                        arm_timer(&mut timer_id, frame_ms);
                     }
                 }
-                // 超上限：pending 已 take 走 = 放弃本帧（不重挂定时器）。
-                // 绝对几何不累积误差；下一个事件 / 收尾 Up 会重发。
             }
         }
         if msg.message == WM_APP {
@@ -213,35 +207,61 @@ pub fn run(cfg: Arc<Config>) {
                 // enabled 开关读原子镜像（T3.3：托盘线程翻转，Arc<Config> 不可原地改）。
                 if ENABLED.load(Ordering::Acquire) {
                     for ev in &events {
-                        let (geom, hwnd) = step(&mut state, ev, &live);
-                        let Some(g) = geom else { continue };
-                        // 抬起事件必须落地（手势收尾不能留中间态）；
-                        // 其余要同时满足：距上次下发 ≥ 刷新周期 **且** 目标已追上上次请求。
-                        let is_up = matches!(ev, EngineEvent::Up { .. });
-                        let due = match last_apply {
-                            None => true,
-                            Some(t) => t.elapsed().as_millis() as u64 >= frame_ms,
-                        };
-                        if is_up || (due && caught_up(req, hwnd)) {
-                            req = apply_geom(g, hwnd);
-                            last_apply = Some(std::time::Instant::now());
-                            pending = None;
-                            retry_rounds = 0;
+                        // **手势边界清闩锁**（2026-10-21 修复）：Down/Up 是手势的开始与
+                        // 结束，陈旧的下发时刻与"上次请求矩形"绝不允许跨手势存活——
+                        // 否则一个属于上一个窗口/上一次缩放的陈旧请求会把新手势永久挡住
+                        // （这正是"快速缩放几次后拖拽/缩放全灭、只有最大化还好使"的成因）。
+                        //
+                        // Up 的顺序很关键：**先补发待发几何，再清闩锁**。收尾那一帧的
+                        // 目标矩形只存在于 `pending`（Up 本身在 Fallback/Resize 态不产出
+                        // SetPos/SetRect），先清就等于把用户松手时的最终位置丢掉——窗口
+                        // 会停在中途尺寸/位置。
+                        if matches!(ev, EngineEvent::Up { .. }) {
+                            if let Some((g, h)) = pending.take() {
+                                let now = std::time::Instant::now();
+                                let req = apply_geom(g, h);
+                                throttle.commit(now, h, req);
+                            }
+                            throttle.reset();
                             if let Some(id) = timer_id.take() {
                                 unsafe { KillTimer(std::ptr::null_mut(), id) };
                             }
+                        } else if matches!(ev, EngineEvent::Down { .. }) {
+                            // Down = 新手势开始：旧手势遗留的待发几何必须直接丢弃
+                            // （几何是绝对的，但它属于旧目标——放炮会摆错窗口）。
+                            throttle.reset();
+                            pending = None;
+                            if let Some(id) = timer_id.take() {
+                                unsafe { KillTimer(std::ptr::null_mut(), id) };
+                            }
+                        }
+                        let (geom, hwnd) = step(&mut state, ev, &live);
+                        let Some(g) = geom else { continue };
+                        let now = std::time::Instant::now();
+                        // 抬起事件必须落地（手势收尾不能留中间态）；其余走节流+软背压。
+                        let is_up = matches!(ev, EngineEvent::Up { .. });
+                        let current = if throttle.outstanding(hwnd) {
+                            hwnd.and_then(winmod::window_rect)
                         } else {
-                            // 推迟：中间态丢弃（几何是绝对的，不累积误差），
-                            // 由定时器在目标追上后补发最新值。
-                            pending = Some((g, hwnd));
-                            // 只在没有定时器时才武装（线程定时器忽略传入 ID，
-                            // 返回值才是拆弹凭据；固定 ID 重复武装 = 炸弹，见上方注释）。
-                            if timer_id.is_none() {
-                                let id =
-                                    unsafe { SetTimer(std::ptr::null_mut(), 0, frame_ms as u32, None) };
-                                if id != 0 {
-                                    timer_id = Some(id as usize);
+                            None
+                        };
+                        match throttle.decide(now, hwnd, current, is_up) {
+                            Decision::Apply => {
+                                let req = apply_geom(g, hwnd);
+                                throttle.commit(now, hwnd, req);
+                                pending = None;
+                                if let Some(id) = timer_id.take() {
+                                    unsafe { KillTimer(std::ptr::null_mut(), id) };
                                 }
+                            }
+                            Decision::Defer => {
+                                // 推迟：中间态丢弃（几何是绝对的，不累积误差），
+                                // 由定时器在目标追上后补发最新值。
+                                throttle.note_deferred(now);
+                                pending = Some((g, hwnd));
+                                // 只在没有定时器时才武装（线程定时器忽略传入 ID，
+                                // 返回值才是拆弹凭据；固定 ID 重复武装 = 炸弹，见上方注释）。
+                                arm_timer(&mut timer_id, frame_ms);
                             }
                         }
                     }
@@ -258,13 +278,18 @@ pub fn run(cfg: Arc<Config>) {
     }
 }
 
-/// 背压判断：目标窗口的当前矩形是否已经等于上一次请求的矩形。
-/// 不等 = 目标应用还在消化上一帧（重排/重绘没做完），此时再灌只会让它的队列越堆越长。
-fn caught_up(req: Option<[i32; 4]>, hwnd: Option<isize>) -> bool {
-    match (req, hwnd) {
-        (Some(r), Some(h)) => winmod::window_rect(h).map(|c| c == r).unwrap_or(true),
-        // 没有历史请求 / 拿不到窗口 → 不拦。
-        _ => true,
+/// 武装节流定时器（同一时刻最多一个）。
+///
+/// **必须存 `SetTimer` 的返回值**：线程定时器（`SetTimer(NULL, …)`）的 `nIDEvent`
+/// 参数会被系统忽略，返回值才是 `KillTimer` 要用的 ID。用固定常量反复 Set/Kill
+/// 是 2026-10-20 定时器炸弹事故的根因（一个手势攒上百个定时器同时放炮）。
+fn arm_timer(timer_id: &mut Option<usize>, frame_ms: u64) {
+    if timer_id.is_some() {
+        return;
+    }
+    let id = unsafe { SetTimer(std::ptr::null_mut(), 0, frame_ms as u32, None) };
+    if id != 0 {
+        *timer_id = Some(id as usize);
     }
 }
 
