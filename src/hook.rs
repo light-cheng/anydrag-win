@@ -43,10 +43,23 @@ static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static MODS_VKS: RwLock<Vec<u16>> = RwLock::new(Vec::new());
 
 /// 更新要监视的修饰键（设置界面保存后调用；启动时 `spawn` 也会调一次）。
+///
+/// **锁污染恢复**：`write()` 中毒时 `unwrap_or_else(|e| e.into_inner())` 就地拆锁，
+/// 绝不像旧版 `if let Ok(..)` 那样静默跳过——一次静默跳过就会让钩子永久收不到
+/// 修饰键（2026-10-20 事故：手势全灭但进程毫无异常，根因就在这条路径上）。
 pub fn set_mods(vks: &[u16]) {
-    if let Ok(mut w) = MODS_VKS.write() {
-        *w = vks.to_vec();
-    }
+    let mut w = MODS_VKS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *w = vks.to_vec();
+}
+
+/// 当前监视列表长度（引擎自愈校验用：与 `live.all_vks().len()` 不等即重发）。
+pub fn mods_len() -> usize {
+    MODS_VKS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 /// LL 钩子是否仍安装在位（callback 卡顿超 300ms 系统会自动移除，
@@ -114,8 +127,12 @@ unsafe extern "system" fn ll_proc(nCode: i32, wParam: usize, lParam: isize) -> i
             let y = (*info).pt.y;
             // 组装按下的修饰键 mask：bit = VK & 0x1F（mods.rs 注记：左侧/右侧修饰键
             // 与基础码落不同 bit；MVP"配置哪个 VK 就检查哪个 bit"）。
+            // 锁污染同样就地拆锁读——绝不让一次中毒把 mods 永久清零。
             let mut mods = 0u32;
-            if let Ok(vks) = MODS_VKS.read() {
+            {
+                let vks = MODS_VKS
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for &vk in vks.iter() {
                     if GetAsyncKeyState(vk as i32) as i32 & 0x8000 != 0 {
                         mods |= 1u32 << (vk & 0x1F);

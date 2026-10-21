@@ -64,8 +64,9 @@ enum Geom {
     Rect { x: i32, y: i32, w: i32, h: i32 },
 }
 
-/// 节流器定时器 id（线程定时器，`SetTimer(NULL, …)`，不需要窗口）。
-const THROTTLE_TIMER: usize = 0xA17D;
+/// 重试轮数上限：目标长期追不上（最小尺寸钳制 / 窗口已最小化 / 应用不重排）时
+/// 放弃本帧——几何是绝对的、不累积误差，下一次事件或收尾 Up 会重发。
+const MAX_RETRY_ROUNDS: u32 = 400;
 
 /// 下发一次几何更新，返回**本次请求的窗口矩形**（供背压判断"目标是否已追上"）。
 ///
@@ -108,39 +109,93 @@ pub fn run(cfg: Arc<Config>) {
     let mut live: Config = (*cfg).clone();
     let mut live_ver = config::version();
     // 几何节流/背压状态（见 `Geom` 注释）。
+    //
+    // **线程定时器（SetTimer(NULL,…)）的 nIDEvent 参数会被系统忽略，返回值才是
+    // KillTimer 要用的 ID**——2026-10-20 冻结事故根因：旧代码用固定常量 ID 反复
+    // Set/Kill，KillTimer 从未真正生效，每次"目标没追上"的推迟都新增一个定时器，
+    // 一个 278 帧的缩放手势能攒上百个定时器同时以 ~4-8ms 放炮 → 引擎消息泵被
+    // WM_TIMER 灌满（心跳仪实测 24 万条/秒且持续增长）→ 100% CPU 空转、真实事件
+    // 饿死 → "程序整个卡死"且手势结束后**永久持续**（定时器杀不掉）。
+    // 修复三件套：① 存返回值按真 ID 拆弹；② timer_id.is_none() 才武装（同一时刻
+    // 最多一个，它自己会在到点时重挂）；③ MAX_RETRY_ROUNDS 兜底放弃本帧。
     let frame_ms = winmod::refresh_interval_ms();
     let mut pending: Option<(Geom, Option<isize>)> = None;
     let mut last_apply: Option<std::time::Instant> = None;
     // 上一次**请求**的窗口矩形：用于判断目标应用是否已经把它落地了。
     let mut req: Option<[i32; 4]> = None;
-    let mut timer_armed = false;
+    let mut timer_id: Option<usize> = None;
+    let mut retry_rounds: u32 = 0;
     let mut msg: _ = unsafe { core::mem::zeroed() };
+    // 心跳仪（仅 ANYDRAG_DEBUG）：按消息类型计数，每秒一条——诊断"CPU 空转但
+    // 无日志"用。哪一类在暴涨，洪水就是谁灌的（2026-10-20 冻结事故现场工具）。
+    let dbg_probe = std::env::var_os("ANYDRAG_DEBUG").is_some();
+    let mut dbg_n: [u64; 3] = [0; 3]; // [WM_APP, WM_TIMER, other]
+    let mut dbg_last = std::time::Instant::now();
     loop {
         let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if r <= 0 {
             break; // 0 = WM_QUIT；-1 = 错误——两种都退泵（进程随 main 退出，LL 钩子自动卸载）。
         }
+        if dbg_probe {
+            let slot = if msg.message == WM_APP {
+                0
+            } else if msg.message == WM_TIMER {
+                1
+            } else {
+                2
+            };
+            dbg_n[slot] += 1;
+            if dbg_last.elapsed() >= std::time::Duration::from_secs(1) {
+                eprintln!(
+                    "[heartbeat] 1s: app={} timer={} other={} pending={} armed={} mods={}",
+                    dbg_n[0],
+                    dbg_n[1],
+                    dbg_n[2],
+                    pending.is_some(),
+                    timer_id.is_some(),
+                    hook::mods_len()
+                );
+                dbg_n = [0; 3];
+                dbg_last = std::time::Instant::now();
+            }
+        }
         // 节流定时器到点 → 重试把被推迟的那次几何落地
         // （目标还没追上的话，下个定时器再试；这是背压的重试节拍）。
         if msg.message == WM_TIMER {
-            if timer_armed {
-                unsafe { KillTimer(std::ptr::null_mut(), THROTTLE_TIMER) };
-                timer_armed = false;
+            // 到点即拆弹：按 SetTimer 返回的真 ID 杀（线程定时器忽略 nIDEvent，
+            // 用常量 ID  KillTimer 是 2026-10-20 定时器炸弹的根因，见上方注释）。
+            if let Some(id) = timer_id.take() {
+                unsafe { KillTimer(std::ptr::null_mut(), id) };
             }
             if let Some((g, h)) = pending.take() {
                 if caught_up(req, h) {
                     req = apply_geom(g, h);
                     last_apply = Some(std::time::Instant::now());
-                } else {
+                    retry_rounds = 0;
+                } else if retry_rounds < MAX_RETRY_ROUNDS {
+                    // 还没追上：继续等，但计一轮（超上限就放弃本帧，见常量注释）
                     pending = Some((g, h));
-                    unsafe {
-                        SetTimer(std::ptr::null_mut(), THROTTLE_TIMER, frame_ms as u32, None)
-                    };
-                    timer_armed = true;
+                    retry_rounds += 1;
+                    if timer_id.is_none() {
+                        let id =
+                            unsafe { SetTimer(std::ptr::null_mut(), 0, frame_ms as u32, None) };
+                        if id != 0 {
+                            timer_id = Some(id as usize);
+                        }
+                    }
                 }
+                // 超上限：pending 已 take 走 = 放弃本帧（不重挂定时器）。
+                // 绝对几何不累积误差；下一个事件 / 收尾 Up 会重发。
             }
         }
         if msg.message == WM_APP {
+            // 自愈校验：钩子监视列表与生效配置必须一致（长度不等 = 被谁清空/污染了，
+            // 立即重发）。2026-10-20 事故：运行中监视列表归零 → 修饰键恒不命中 →
+            // "所有手势全灭但进程毫无异常"。每事件一次的代价是两次无竞争读锁。
+            let want = live.all_vks();
+            if hook::mods_len() != want.len() {
+                hook::set_mods(&want);
+            }
             // 热重载检查（无锁读一个原子；无变化时零开销）。
             let v = config::version();
             if v != live_ver {
@@ -171,18 +226,23 @@ pub fn run(cfg: Arc<Config>) {
                             req = apply_geom(g, hwnd);
                             last_apply = Some(std::time::Instant::now());
                             pending = None;
-                            if timer_armed {
-                                unsafe { KillTimer(std::ptr::null_mut(), THROTTLE_TIMER) };
-                                timer_armed = false;
+                            retry_rounds = 0;
+                            if let Some(id) = timer_id.take() {
+                                unsafe { KillTimer(std::ptr::null_mut(), id) };
                             }
                         } else {
                             // 推迟：中间态丢弃（几何是绝对的，不累积误差），
                             // 由定时器在目标追上后补发最新值。
                             pending = Some((g, hwnd));
-                            unsafe {
-                                SetTimer(std::ptr::null_mut(), THROTTLE_TIMER, frame_ms as u32, None)
-                            };
-                            timer_armed = true;
+                            // 只在没有定时器时才武装（线程定时器忽略传入 ID，
+                            // 返回值才是拆弹凭据；固定 ID 重复武装 = 炸弹，见上方注释）。
+                            if timer_id.is_none() {
+                                let id =
+                                    unsafe { SetTimer(std::ptr::null_mut(), 0, frame_ms as u32, None) };
+                                if id != 0 {
+                                    timer_id = Some(id as usize);
+                                }
+                            }
                         }
                     }
                 } else if !matches!(state, DragState::Idle) {
