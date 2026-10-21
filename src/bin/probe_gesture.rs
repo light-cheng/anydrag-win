@@ -447,6 +447,74 @@ fn main() {
             );
             println!("RESIZE_BENCH_DONE");
         }
+        "resize-storm" => {
+            // 持续高频缩放压测（2026-10-21 事故 5 的复现器）。
+            // 用户报障是"一直高频缩放才会卡死"，而 resize-bench 每轮只注入 200ms、
+            // 中间静默 300ms，节奏太松，触发不了。这里改成：
+            //   - 按住 Alt+Ctrl 不松手，连续注入 rounds 次来回摆动；
+            //   - 每次摆动 = 40 步的扫动，步间不留 sleep（尽可能快）；
+            //   - 全程只按下/抬起一次鼠标（一个超长手势），最接近"一直快速缩放"。
+            // 判据：风暴结束后窗口必须仍能被缩放。
+            let rounds: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60);
+            let w0 = f0[2] - f0[0];
+            let rx = f0[0] + w0 * 3 / 4;
+            let ry = (f0[1] + f0[3]) / 2;
+            key_event(VK_MENU, false);
+            key_event(VK_CONTROL, false);
+            mouse_move_abs(rx, ry);
+            std::thread::sleep(Duration::from_millis(80));
+            mouse_button(true);
+            std::thread::sleep(Duration::from_millis(40));
+            let t0 = std::time::Instant::now();
+            let mut injected = 0u32;
+            for r in 0..rounds {
+                let dir: i32 = if r % 2 == 0 { 1 } else { -1 };
+                for i in 1..=40 {
+                    mouse_move_abs(rx + dir * (120 * i / 40), ry);
+                    injected += 1;
+                }
+            }
+            let inject_ms = t0.elapsed().as_millis();
+            mouse_button(false);
+            key_event(VK_CONTROL, true);
+            key_event(VK_MENU, true);
+            std::thread::sleep(Duration::from_millis(600));
+            let f1 = frame_of(hwnd).expect("dwm frame after storm");
+            let rate = injected as f64 * 1000.0 / (inject_ms.max(1) as f64);
+            println!(
+                "resize-storm: rounds={rounds} injected={injected} inject_ms={inject_ms} rate={rate:.0}/s"
+            );
+            println!("resize-storm: w0={w0} w_after={}", f1[2] - f1[0]);
+            // 存活判定：风暴之后再做一个干净的缩放，必须仍然生效。
+            let f_pre = frame_of(hwnd).expect("dwm frame");
+            let w_pre = f_pre[2] - f_pre[0];
+            let rx2 = f_pre[0] + w_pre * 3 / 4;
+            let ry2 = (f_pre[1] + f_pre[3]) / 2;
+            key_event(VK_MENU, false);
+            key_event(VK_CONTROL, false);
+            mouse_move_abs(rx2, ry2);
+            std::thread::sleep(Duration::from_millis(80));
+            mouse_button(true);
+            std::thread::sleep(Duration::from_millis(60));
+            for i in 1..=4 {
+                mouse_move_abs(rx2 + RZ_DRAG_PX * i / 4, ry2);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            mouse_button(false);
+            key_event(VK_CONTROL, true);
+            key_event(VK_MENU, true);
+            std::thread::sleep(Duration::from_millis(400));
+            let f2 = frame_of(hwnd).expect("dwm frame after verify");
+            let dw = (f2[2] - f2[0]) - w_pre;
+            println!(
+                "resize-storm: verify w_pre={w_pre} w_post={} dw={dw}",
+                f2[2] - f2[0]
+            );
+            println!(
+                "RESIZE_STORM={}",
+                if dw.abs() >= 40 { "SURVIVED" } else { "DEAD" }
+            );
+        }
         "native-resize" => {
             // **对照实验**：用户抱怨"还不如直接用鼠标去边缘缩放"，那就真的去边缘拖。
             // 光标放到窗口右边框（DWM 帧外那圈 ~7px 不可见边框里）按下左键拖动——

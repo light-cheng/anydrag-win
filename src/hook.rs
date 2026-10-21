@@ -26,8 +26,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::engine::EngineEvent;
 use crate::ring::Ring;
 
-/// 64 槽固定 SPSC（GOAL T1.2/§5：生产者 = hook 线程，消费者 = engine 线程）。
-pub const RING_SLOTS: usize = 64;
+/// 环容量（GOAL T1.2/§5：生产者 = hook 线程，消费者 = engine 线程）。
+///
+/// **为什么从 64 扩到 512（2026-10-21）**：`WH_MOUSE_LL` 按鼠标硬件率推事件，
+/// 实测注入 4183 次/秒时 64 槽环在消费端一批 `SetWindowPos + sync_paint` 的
+/// 时间窗内就溢出——心跳仪实测 `dropped=7172/12000`（60% 被丢）。丢 Move 无害
+/// （几何是绝对值），但**丢 `Up` 会让状态机永远停在 `Resize` 态、`EndSizeMove`
+/// 永不发出、目标应用永久卡在尺寸调整相位**。512 槽 = 128 个事件/帧的余量，
+/// 足以吸收任何突发；消费者侧再用 `coalesce::coalesce_moves` 把每批工作量压到 O(1)。
+pub const RING_SLOTS: usize = 512;
 
 /// 全局事件环。`LazyLock` 保证一次性堆分配在钩子线程启动时完成，
 /// LL 回调内 `RING.push` 无分配（满时自旋 ≤ SPIN_LIMIT 后丢新，O(1)）。

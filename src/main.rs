@@ -2,6 +2,7 @@
 //! main（DPI 感知 + 托盘泵）/ engine（ring 消费 + 状态机 + FFI 动作）/
 //! hook（WH_MOUSE_LL，O(1) 回调塞 ring + PostThreadMessage）。
 
+mod coalesce;
 mod config;
 mod engine;
 mod engine_loop;

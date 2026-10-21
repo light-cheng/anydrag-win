@@ -17,6 +17,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -115,6 +116,8 @@ pub fn run(cfg: Arc<Config>) {
     let mut throttle = Throttle::new(frame_ms);
     let mut pending: Option<(Geom, Option<isize>)> = None;
     let mut timer_id: Option<usize> = None;
+    // 最后一次收到事件（任意类型）的时刻——状态看门狗用它判断手势是否已停滞。
+    let mut idle_since = std::time::Instant::now();
     let mut msg: _ = unsafe { core::mem::zeroed() };
     // 心跳仪（仅 ANYDRAG_DEBUG）：按消息类型计数，每秒一条——诊断"CPU 空转但
     // 无日志"用。哪一类在暴涨，洪水就是谁灌的（2026-10-20 冻结事故现场工具）。
@@ -137,13 +140,15 @@ pub fn run(cfg: Arc<Config>) {
             dbg_n[slot] += 1;
             if dbg_last.elapsed() >= std::time::Duration::from_secs(1) {
                 eprintln!(
-                    "[heartbeat] 1s: app={} timer={} other={} pending={} armed={} mods={}",
+                    "[heartbeat] 1s: app={} timer={} other={} pending={} armed={} mods={} dropped={} state={}",
                     dbg_n[0],
                     dbg_n[1],
                     dbg_n[2],
                     pending.is_some(),
                     timer_id.is_some(),
-                    hook::mods_len()
+                    hook::mods_len(),
+                    hook::RING.dropped(),
+                    state_name(&state),
                 );
                 dbg_n = [0; 3];
                 dbg_last = std::time::Instant::now();
@@ -182,7 +187,35 @@ pub fn run(cfg: Arc<Config>) {
                 }
             }
         }
+        // **状态看门狗**（2026-10-21）：状态机若停在 Fallback/Resize 态，说明提交时
+        // 发过 `BeginSizeMove` 却始终没等到配对的 `EndSizeMove`（`Up` 被丢弃 /
+        // 目标窗口在相位中途销毁）。目标应用会**永久卡在尺寸调整相位**，此后所有
+        // 重排被无限推迟（MEMORY 坑 #1 的死法）。这里在"状态非 Idle 但已长时间没有
+        // 任何事件"时强制收尾：补发 `EndSizeMove`、把状态打回 Idle。
+        if !matches!(state, DragState::Idle)
+            && idle_since.elapsed() >= Duration::from_millis(STALE_GESTURE_MS)
+        {
+            let in_phase =
+                matches!(state, DragState::Fallback { .. } | DragState::Resize { .. });
+            if let (true, Some(h)) = (in_phase, gesture_hwnd(&state)) {
+                winmod::notify_size_move(h, false);
+            }
+            if dbg_probe {
+                eprintln!(
+                    "[watchdog] 手势停滞 {}ms，强制收尾 state={} in_phase={in_phase}",
+                    idle_since.elapsed().as_millis(),
+                    state_name(&state)
+                );
+            }
+            state = DragState::Idle;
+            pending = None;
+            throttle.reset();
+            if let Some(id) = timer_id.take() {
+                unsafe { KillTimer(std::ptr::null_mut(), id) };
+            }
+        }
         if msg.message == WM_APP {
+            idle_since = std::time::Instant::now();
             // 自愈校验：钩子监视列表与生效配置必须一致（长度不等 = 被谁清空/污染了，
             // 立即重发）。2026-10-20 事故：运行中监视列表归零 → 修饰键恒不命中 →
             // "所有手势全灭但进程毫无异常"。每事件一次的代价是两次无竞争读锁。
@@ -202,8 +235,14 @@ pub fn run(cfg: Arc<Config>) {
                 unsafe { core::mem::zeroed() };
             let n = hook::RING.drain_impl(&mut buf);
             if n > 0 {
-                let events: Vec<EngineEvent> =
+                let mut events: Vec<EngineEvent> =
                     unsafe { (0..n).map(|i| buf[i].assume_init()).collect() };
+                // **批内合并**（2026-10-21 高频卡死修复）：连续 Move 只保留最后一个。
+                // 状态机对 Move 是纯函数（`frame + (cur - start)`），跳过中间态不改变
+                // 结果；Down/Up 是相位边界、绝不丢。这让每批工作量从 O(事件数) 降到
+                // O(1)，是"一直高频缩放"下消费端不再落后的关键。
+                let kept = crate::coalesce::coalesce_moves(&mut events);
+                events.truncate(kept);
                 // enabled 开关读原子镜像（T3.3：托盘线程翻转，Arc<Config> 不可原地改）。
                 if ENABLED.load(Ordering::Acquire) {
                     for ev in &events {
@@ -275,6 +314,40 @@ pub fn run(cfg: Arc<Config>) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+/// 手势停滞多久后强制收尾（ms）。
+///
+/// **为什么需要（2026-10-21）**：状态机若停在 `Fallback`/`Resize` 态，说明提交时
+/// 发过 `BeginSizeMove` 却没等到配对的 `EndSizeMove`（`Up` 被丢弃 / 目标窗口在相位
+/// 中途销毁）。目标应用会**永久卡在尺寸调整相位**，此后所有重排被无限推迟
+/// （MEMORY 坑 #1 的死法）。2 秒远大于任何正常手势的事件间隔，绝不会误杀。
+const STALE_GESTURE_MS: u64 = 2000;
+
+/// 状态机状态名（心跳仪/看门狗日志用；不打印 target 细节，避免被窗口句柄淹没）。
+fn state_name(s: &DragState) -> &'static str {
+    match s {
+        DragState::Idle => "Idle",
+        DragState::Armed { .. } => "Armed",
+        DragState::ArmedResize { .. } => "ArmedResize",
+        DragState::Native { .. } => "Native",
+        DragState::Fallback { .. } => "Fallback",
+        DragState::Resize { .. } => "Resize",
+        DragState::MiddleArmed { .. } => "MiddleArmed",
+    }
+}
+
+/// 状态机当前手势的目标窗口（看门狗补发 `EndSizeMove` 用）。
+fn gesture_hwnd(s: &DragState) -> Option<isize> {
+    match s {
+        DragState::Armed { target, .. }
+        | DragState::Native { target }
+        | DragState::Fallback { target, .. }
+        | DragState::ArmedResize { target, .. }
+        | DragState::Resize { target, .. }
+        | DragState::MiddleArmed { target, .. } => Some(target.hwnd),
+        DragState::Idle => None,
     }
 }
 

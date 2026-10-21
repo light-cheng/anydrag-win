@@ -308,3 +308,40 @@ alt 最大化（有效），alt+ctrl 缩放（失效）"。
 
 **症状指纹与用户报障逐项吻合**（旧版：拖拽 FAIL / 缩放 FAIL / 最大化 PASS），
 修复后四项全 PASS。
+
+### 追加：真正的"一直高频"才是触发条件（事件环溢出）
+
+初版复现器（`resize-bench`）每轮只注入 200ms、中间静默 300ms，节奏太松，**触发不了**
+用户说的"一直高频缩放"。新增 `probe_gesture resize-storm`：按住 Alt+Ctrl **全程不松手**，
+连续注入 `rounds × 40` 次扫动，步间**不留 sleep**，把注入速率拉到 4000-6000 次/秒。
+
+此时暴露了比背压更根本的一层根因：**64 槽事件环溢出**。
+`WH_MOUSE_LL` 按鼠标硬件率推事件，而 engine 每批要花真实时间在
+`SetWindowPos` + `sync_paint`（`SendMessageTimeoutW(WM_SYNCPAINT, …, 120ms)`）上，
+消费跟不上生产。心跳仪（本轮新增 `dropped=` 与 `state=` 两个字段）实测：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 注入事件 | 12000 | 12000 |
+| `dropped`（环满丢弃） | **7172（60%）** | **0** |
+| 注入速率 | 4183/s | 6170/s（更快了） |
+| 结果 | 靠运气（`Up` 恰好没被丢） | `RESIZE_STORM=SURVIVED` |
+
+**为什么丢 `Up` 是灾难**：`Up` 丢失 ⇒ 状态机永远停在 `Fallback`/`Resize` 态 ⇒
+`Action::EndSizeMove` 永不发出 ⇒ 目标应用**永久卡在尺寸调整相位**、所有重排被无限
+推迟（正是 MEMORY 坑 #1 的死法），且此后手势全部受影响。丢 Move 则无害（几何是绝对值）。
+
+**修复两层**：
+
+1. **生产者侧扩容**：`hook::RING_SLOTS` 64 → 512（128 个事件/帧的余量，吸收任何突发）。
+2. **消费者侧合并**：新增纯模块 `src/coalesce.rs` 的 `coalesce_moves`——一批 drain
+   出来的事件里连续 `Move` 只保留**最后一个**。状态机对 Move 是纯函数
+   （`frame + (cur - start)`），跳过中间态不改变结果，每批工作量从 O(事件数) 降到 O(1)。
+   合并规则：`Down`/`Up`/`MiddleDown`/`MiddleUp` 都是**相位边界**，两侧 Move 不可跨越；
+   只删"被后续 Move 完全覆盖"的事件，绝不重排、绝不丢非 Move 事件（6 条单测钉死）。
+3. **状态看门狗兜底**：`STALE_GESTURE_MS = 2000`——若状态机非 Idle 且已 2 秒无任何
+   事件（= 配对的 `EndSizeMove` 永远不会来了），强制补发 `EndSizeMove` 并把状态打回
+   Idle。这是"绝不把目标应用永久留在尺寸调整相位"的最后一道防线。
+
+**回归**：`cargo test` **53/53 全绿**（新增 `coalesce` 6 条）。400 轮风暴（16000 次注入）
+后 `alt-drag` / `ctrl-resize` / `alt-dbl` / `middle-snap` 四项仍全 PASS。
