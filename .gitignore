@@ -17,3 +17,7 @@ resize-diag.log
 
 #/target
 .pi/
+
+# ANYDRAG_DEBUG=1 诊断日志
+d*.log
+dbg*.log
