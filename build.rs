@@ -1,9 +1,15 @@
-//! 构建脚本：把 comctl32 v6 视觉样式清单复制到产物目录。
+//! 构建脚本：把 exe 图标与 comctl32 v6 视觉样式清单**内嵌进 PE 资源段**。
 //!
-//! 清单文件在包根目录 `anydrag-win.exe.manifest`（Windows 外部清单命名规则：
-//! `<exe 名>.exe.manifest`，与 exe 同目录即被系统加载）。为什么用外部清单而不是
-//! 内嵌资源：项目原则是"不内嵌资源文件"（托盘图标也是运行时自绘），外部清单
-//! 零构建依赖、零工具链要求（不需要 rc.exe / windres）。
+//! 两者都由 `assets/app.rc` 描述，经 Windows SDK 的 `rc.exe` 编成 `.res`，
+//! 再用 `cargo:rustc-link-arg` 交给链接器 —— **不引入任何 Rust 构建依赖**
+//! （不用 winres / embed-resource crate）。
+//!
+//! 为什么 manifest 也从"外部同名文件"改成内嵌（2026-10-21）：外部清单要求
+//! `anydrag-win.exe.manifest` 与 exe 同目录且同名，拷贝/打包时极易漏掉，一漏
+//! 界面就退回 Windows 95 灰控件样式，且**没有任何报错**。内嵌进资源段后
+//! **单文件即可分发**，不存在漏拷问题。
+//!
+//! 托盘图标仍是运行时自绘（`src/icon.rs`），与此无关。
 
 use std::path::PathBuf;
 
@@ -12,22 +18,7 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let src = manifest_dir.join("anydrag-win.exe.manifest");
-    if !src.exists() {
-        return;
-    }
-    // 产物目录：CARGO_TARGET_DIR 优先，否则 <包目录>/target/<profile>。
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
-    let target = match std::env::var("CARGO_TARGET_DIR") {
-        Ok(d) => PathBuf::from(d),
-        Err(_) => manifest_dir.join("target"),
-    };
-    let dst = target.join(&profile).join("anydrag-win.exe.manifest");
-    if let Err(e) = std::fs::copy(&src, &dst) {
-        println!("cargo:warning=failed to copy manifest to {dst:?}: {e}");
-    }
-
-    embed_icon(&manifest_dir);
+    embed_resources(&manifest_dir);
 }
 
 
@@ -40,13 +31,15 @@ fn main() {
 /// cargo:rustc-link-arg 交给链接器 —— 不引入任何 Rust 构建依赖。
 ///
 /// 找不到 rc.exe 时只发 warning、不失败：图标是外观优化，不该阻断构建。
-fn embed_icon(manifest_dir: &PathBuf) {
+fn embed_resources(manifest_dir: &PathBuf) {
     let rc_src = manifest_dir.join("assets").join("app.rc");
     let ico = manifest_dir.join("assets").join("anydrag-win.ico");
     println!("cargo:rerun-if-changed={}", rc_src.display());
     println!("cargo:rerun-if-changed={}", ico.display());
+    let manifest = manifest_dir.join("anydrag-win.exe.manifest");
+    println!("cargo:rerun-if-changed={}", manifest.display());
     if !rc_src.exists() || !ico.exists() {
-        println!("cargo:warning=icon assets missing, skipping exe icon");
+        println!("cargo:warning=resource assets missing, skipping embedding");
         return;
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
@@ -88,7 +81,7 @@ fn embed_icon(manifest_dir: &PathBuf) {
         }
     }
     if !ok {
-        println!("cargo:warning=rc.exe not found or failed; exe icon not embedded");
+        println!("cargo:warning=rc.exe not found or failed; icon/manifest not embedded");
         return;
     }
     // MSVC link.exe 直接接受 .res 作为链接器输入。

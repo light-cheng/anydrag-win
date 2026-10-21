@@ -5,3 +5,9 @@
 #include <winres.h>
 
 IDI_ICON1 ICON "anydrag-win.ico"
+
+// comctl32 v6 视觉样式清单，作为 RT_MANIFEST 资源内嵌（2026-10-21）。
+// RT_MANIFEST = 24；ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID（进程级清单）。
+// 内嵌后不再需要 exe 旁边那个 anydrag-win.exe.manifest 文件 —— 单文件分发。
+// 用字面量 24 而不是宏，避免 winres.h 在不同 SDK 版本下的包含差异。
+1 24 "../anydrag-win.exe.manifest"
