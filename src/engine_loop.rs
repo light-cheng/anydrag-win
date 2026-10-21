@@ -223,12 +223,23 @@ pub fn run(cfg: Arc<Config>) {
             if hook::mods_len() != want.len() {
                 hook::set_mods(&want);
             }
-            // 热重载检查（无锁读一个原子；无变化时零开销）。
+            // 热重载检查，两条来源都要看：
+            // 1) `config::version()` —— 设置界面点"保存"走 `replace()` 自增；
+            // 2) **磁盘文件 mtime** —— 用户直接手改 config.json（2026-10-21 用户报障：
+            //    他改完文件仍拖不动，因为旧实现只认版本号，手改永远不会触发重载）。
+            //    这一步是每批一次 `metadata()`，无变化时立即返回。
+            let file_changed = config::reload_if_changed();
             let v = config::version();
-            if v != live_ver {
+            if v != live_ver || file_changed {
                 live = config::snapshot();
-                live_ver = v;
+                live_ver = config::version();
                 hook::set_mods(&live.all_vks());
+                if std::env::var_os("ANYDRAG_DEBUG").is_some() {
+                    eprintln!(
+                        "[config] 已重载（file_changed={file_changed}）strategy={} mods={:?}",
+                        live.default_strategy, live.modifiers
+                    );
+                }
             }
             // hook 每事件 Post 一条 WM_APP；一次 drain 吃干净（可能攒了多条）。
             let mut buf: [core::mem::MaybeUninit<EngineEvent>; hook::RING_SLOTS] =

@@ -32,14 +32,67 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 static STORE: OnceLock<RwLock<Config>> = OnceLock::new();
 static VERSION: AtomicU64 = AtomicU64::new(0);
 
+/// 配置文件"最后已知的修改时间"（纳秒自 UNIX_EPOCH），用于**外部编辑自动重载**。
+///
+/// **为什么需要（2026-10-21 用户报障）**：旧实现里版本号只由 `replace()` 自增，
+/// 而 `replace()` 只在设置界面点"保存"时调用。用户按 README 直接手改
+/// `%APPDATA%\anydrag-win\config.json` 时，**引擎完全不会察觉**——它一直用
+/// 启动时的内存快照，于是"我明明改成 fallback 了，怎么还是拖不动"（实测确认：
+/// 改文件后引擎仍发 `BeginNativeDrag`，只有重启进程才生效）。
+///
+/// 这里记住文件的 mtime，引擎每批事件比一次（一次 `metadata()` 系统调用），
+/// 变了就重新 `load()` 并 `replace()`——手改配置文件即时生效，无需重启。
+static FILE_STAMP: AtomicU64 = AtomicU64::new(0);
+
 /// 启动时装入初始配置（main 调用一次）。
 pub fn init(cfg: Config) {
     let _ = STORE.set(RwLock::new(cfg));
+    mark_file_current();
 }
 
 /// 配置版本号：每次 `replace()` 自增。engine 线程用它判断是否需要刷新快照。
 pub fn version() -> u64 {
     VERSION.load(Ordering::Acquire)
+}
+
+/// 配置文件的修改时间戳（纳秒），取不到返回 0。
+fn file_stamp() -> u64 {
+    use std::time::UNIX_EPOCH;
+    std::fs::metadata(config_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// 记录"当前磁盘配置"的时间戳（`init` 与每次 `replace` 后调用），
+/// 使下一次 `reload_if_changed` 不会把"我们自己刚写的"误判成外部修改。
+pub fn mark_file_current() {
+    FILE_STAMP.store(file_stamp(), Ordering::Release);
+}
+
+/// **外部编辑自动重载**：磁盘文件变了就重新载入并 `replace()`，返回是否重载。
+///
+/// 引擎线程在每个事件批次调一次（一次 `metadata()` 系统调用，无竞争时
+/// 是微秒级）。这样用户手改 `config.json` 能**立即生效**，不必重启程序——
+/// 2026-10-21 用户报障的直接原因就是缺了这条路径（他改完文件仍拖不动，
+/// 因为引擎还在用启动时的内存快照）。
+pub fn reload_if_changed() -> bool {
+    let stamp = file_stamp();
+    if stamp == 0 {
+        return false; // 文件不存在/不可读：保持现状，不覆盖内存里的有效配置
+    }
+    if stamp == FILE_STAMP.load(Ordering::Acquire) {
+        return false; // 没变化：零开销退出
+    }
+    // 先记下时间戳再解析：解析失败时也不会每批重复读盘。
+    FILE_STAMP.store(stamp, Ordering::Release);
+    let fresh = load();
+    // enabled 也同步到原子镜像（手改 enabled 同样要生效）。
+    ENABLED.store(fresh.enabled, Ordering::Release);
+    replace(fresh);
+    true
 }
 
 /// 取当前配置的快照（未 `init` 时返回默认值，保证任何调用顺序都不 panic）。
@@ -59,6 +112,9 @@ pub fn replace(cfg: Config) {
         }
     }
     VERSION.fetch_add(1, Ordering::Release);
+    // 记住"这是我们自己写的"：否则 reload_if_changed 会把本次写入误判成外部编辑，
+    // 白白再读一遍盘（幂等，但没必要）。
+    mark_file_current();
 }
 
 /// 默认拖动策略。T2.3 spike（2026-10-15）实测定稿："fallback"——
@@ -255,6 +311,38 @@ mod tests {
         f.write_all(b"{ this is : not json ").unwrap();
         let c = load_from(&path);
         assert_eq!(c, Config::default(), "corrupt file must yield defaults, not panic");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：2026-10-21 用户报障——手改 config.json 后引擎毫无反应。
+    /// 这里钉住 `file_stamp` 的核心语义：文件内容变化必须改变时间戳，
+    /// 从而让 `reload_if_changed` 察觉（真实路径依赖系统 mtime 精度，
+    /// 故此处用显式路径验证写入会刷新 mtime，而不是依赖全局 config_path）。
+    #[test]
+    fn external_edit_changes_file_stamp() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tmp_dir("mtime");
+        let path = dir.join("config.json");
+        let mut c = Config::default();
+        save_to(&c, &path).unwrap();
+        let s1 = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        assert!(s1 > 0, "a saved file must have a usable mtime");
+        // 确保 mtime 有可见变化（部分文件系统时间粒度较粗）。
+        std::thread::sleep(Duration::from_millis(20));
+        c.default_strategy = "native".into();
+        save_to(&c, &path).unwrap();
+        let s2 = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        assert_ne!(s1, s2, "rewriting the file must change its mtime stamp");
         let _ = fs::remove_dir_all(&dir);
     }
 
