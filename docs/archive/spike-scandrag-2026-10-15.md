@@ -1,3 +1,5 @@
+> **已归档（2026-10-21）**：本 spike 的结论（默认策略 = `fallback`）已被 `AGENTS.md` §4 取代 —— native 拖动策略已整条移除，因为 fallback（`SetWindowPos`） 实测对**所有**应用都生效，包括本文件记录为"生效"的 explorer。保留作考古。
+
 # T2.3 Spike 记录：跨进程 `SC_DRAGMOVE (0xF012)` 原生拖动可行性
 
 - **日期**：2026-10-15

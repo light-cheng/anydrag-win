@@ -38,6 +38,16 @@ target\release\anydrag-win.exe
   （系统行为，任何全局钩子都拦不住）。
 - **Alt+Ctrl 缩放不需要贴边**：把窗口想成九宫格——抓左/右列就横向缩放、抓上/下排就
   纵向缩放、抓正中间就取**就近角**。抓哪儿都能缩，这正是它比"自己去找窗口边缘"强的地方。
+
+### 拖动是怎么实现的（一句话版）
+
+所有应用的拖动都走同一条路：引擎按光标位移算目标矩形，用 `SetWindowPos` 下发，
+并成对发送 `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` 让目标应用把重排推迟到松手，
+外加节流与背压防止灌得比应用重排得快。
+
+项目早期还有第二条路（远程 `SC_DRAGMOVE`，让目标应用自己跑原生拖动循环），
+**已于 2026-10-21 移除**：它只在 explorer/mspaint 等部分应用生效，其余完全拖不动
+且毫无报错，而 `SetWindowPos` 对所有应用都生效。详见 `AGENTS.md` §4。
 - 拖动阈值 5px、双击窗口默认跟随系统（`GetDoubleClickTime`），可配置（见下）。
 - **中键分屏不会影响普通中键点击**：只有拖拽位移超过阈值（默认 40px）才吸附，
   没拖动就松开 = 原样交给应用（中键粘贴/滚动照常）。不需要可在设置里关掉。
@@ -59,9 +69,9 @@ target\release\anydrag-win.exe
 ### 设置界面
 
 托盘菜单「设置…」打开的窗口（也可以 `anydrag-win.exe --settings` 直接开），可改：
-拖动/双击的触发键、缩放的触发键、拖动阈值、双击间隔、默认拖动通道、中键分屏开关与阈值、
-"完全无视手势"和"强制 fallback"两份进程名单。**点保存立即生效**——配置通过版本号热重载到
-引擎线程，触发键也会同步给鼠标钩子，不需要重启进程。
+拖动/双击的触发键、缩放的触发键、拖动阈值、双击间隔、中键分屏开关与阈值、
+"完全无视手势"的进程名单。**点保存立即生效**——配置热重载到引擎线程，
+触发键也会同步给鼠标钩子，不需要重启进程。
 
 ## 配置
 
@@ -76,11 +86,7 @@ target\release\anydrag-win.exe
 | `resize_modifiers` | `VK 码数组` | `[17, 18]`（=Ctrl+Alt） | 缩放的触发键组合，要求**全部同时按下**；在窗口任意位置按下即生效（方向按九宫格/就近角判定，不需贴边）。`[]` = 关闭缩放 |
 | `drag_threshold_px` | 像素 | `5` | 位移达到才提交拖动，否则视为双击候选 |
 | `double_click_ms` | 毫秒 / `null` | `null`（跟随系统） | 双击判定窗口；显式给定则覆盖系统值 |
-| `default_strategy` | `"native"` \| `"fallback"` | `"fallback"` | 拖动实现通道。本环境 spike 实测：`native`（远程 `SC_DRAGMOVE`）
-  在部分应用（如 Win11 打包版 notepad）上失效，故默认 fallback（`SetWindowPos`，
-  全应用可用）。想对 explorer 等用原生通道可改 `"native"` |
 | `native_excluded` | 进程名(小写)数组 | `[]` | 名单内应用**完全无视手势**（例如不想被全局钩子打扰的应用） |
-| `fallback_apps` | 进程名(小写)数组 | `[]` | 名单内应用**强制走 fallback 通道**（即使 `default_strategy` 是 native） |
 | `middle_snap` | bool | `true` | 中键方向分屏开关。`false` 时中键完全不干预 |
 | `middle_snap_threshold_px` | 像素 | `40` | 中键拖拽超过它才判定分屏方向；没拖动就松开 = 普通中键点击 |
 
@@ -123,16 +129,19 @@ target\release\anydrag-win.exe
 - **多显示器**：坐标统一物理像素（Per-Monitor-v2 DPI 感知），跨屏拖动可用；
   最大化判定按"窗口所属显示器的工作区"。
 - **Win11 打包应用**（notepad 等）：其宿主辅助窗会劫持命中测试，本工具已用
-  Z 序候选扫描规避（实测不移动、不点错窗）；`native` 通道对这类应用不可用，
-  默认 fallback 即为此定（见 `docs/spike-scandrag.md`）。
+  Z 序候选扫描规避（实测不移动、不点错窗）。
 - 配置**已全量支持热重载**：设置界面保存与直接手改文件都即时生效，无需重启
   （2026-10-21 补齐手改路径；此前只有设置界面保存会生效）。
 - 只有一份实例：多开只会装多条钩子、无收益。
 
 ## 开发
 
+> **改这个仓库前先读 [`AGENTS.md`](AGENTS.md)** —— 架构不变量、配置热重载机制、
+> 已移除的设计（及为什么移除）、以及 14 条实测踩过的坑（定时器炸弹、背压闩锁死锁、
+> 事件环溢出、异步 placement 不一致态……）都在里面。
+
 ```bash
-cargo test            # 56 个单测（纯逻辑模块 ring/mods/engine/config/icon/coalesce/throttle 零 windows-sys）
+cargo test            # 55 个单测（纯逻辑模块零 windows-sys）
 cmd /c "build.bat"     # release 构建
 ```
 

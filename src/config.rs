@@ -1,6 +1,6 @@
 //! 配置：`%APPDATA%\anydrag-win\config.json`。
 //!
-//! 纯逻辑模块——不 import windows-sys（可单测边界，见 GOAL §7）。
+//! 纯逻辑模块——不 import windows-sys（可单测边界，见 AGENTS.md §1 不变量 4）。
 //! 序列化用 serde；缺失字段/损坏文件一律回退默认值并打警告，绝不 panic。
 
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ static VERSION: AtomicU64 = AtomicU64::new(0);
 /// 而 `replace()` 只在设置界面点"保存"时调用。用户按 README 直接手改
 /// `%APPDATA%\anydrag-win\config.json` 时，**引擎完全不会察觉**——它一直用
 /// 启动时的内存快照，于是"我明明改成 fallback 了，怎么还是拖不动"（实测确认：
-/// 改文件后引擎仍发 `BeginNativeDrag`，只有重启进程才生效）。
+/// 改文件后引擎仍用启动时的快照，只有重启进程才生效）。
 ///
 /// 这里记住文件的 mtime，引擎每批事件比一次（一次 `metadata()` 系统调用），
 /// 变了就重新 `load()` 并 `replace()`——手改配置文件即时生效，无需重启。
@@ -117,12 +117,6 @@ pub fn replace(cfg: Config) {
     mark_file_current();
 }
 
-/// 默认拖动策略。T2.3 spike（2026-10-15）实测定稿："fallback"——
-/// 远程 0xF012 在 explorer 上生效（B 按键变体 dx=160）但 notepad 失效，
-/// 按 GOAL 判定规则（两者均生效才可用 native）落 fallback。
-/// 证据与复跑方法见 docs/spike-scandrag.md。
-const DEFAULT_STRATEGY: &str = "fallback";
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -140,12 +134,13 @@ pub struct Config {
     pub drag_threshold_px: u32,
     /// 双击判定窗口。None = 跟随系统 GetDoubleClickTime()；默认 None。
     pub double_click_ms: Option<u32>,
-    /// "native" | "fallback"——T2.3 spike 结论写入的默认值。
-    pub default_strategy: String,
     /// 进程文件名（小写）→ 该应用完全无视手势。
+    ///
+    /// 这是**唯一**的进程名单。2026-10-21 删除了 native 拖动策略（远程
+    /// `SC_DRAGMOVE`，只在 explorer/mspaint 等部分应用生效，其余完全拖不动），
+    /// 顺带删掉了配套的 `fallback_apps`——拖动只剩 `SetWindowPos` 一条路，
+    /// 不再有"某应用要强制回退"的说法。排除表与拖动策略无关，保留。
     pub native_excluded: Vec<String>,
-    /// 进程文件名 → 强制 fallback 策略。
-    pub fallback_apps: Vec<String>,
     /// 中键方向分屏开关（2026-10-16 用户要求）。true 时：按住中键拖动超过
     /// `middle_snap_threshold_px` 再松开 → 窗口吸附到该方向对应的半屏/四分之一屏。
     /// 未达阈值的中键点击**不干预**（应用自己的中键粘贴/滚动照常）。
@@ -164,9 +159,7 @@ impl Default for Config {
             resize_modifiers: DEFAULT_RESIZE_MODS.to_vec(),
             drag_threshold_px: 5,
             double_click_ms: None,
-            default_strategy: DEFAULT_STRATEGY.to_string(),
             native_excluded: Vec::new(),
-            fallback_apps: Vec::new(),
             middle_snap: true,
             middle_snap_threshold_px: 40,
         }
@@ -284,9 +277,7 @@ mod tests {
         assert_eq!(c.modifiers, DEFAULT_MODS, "modifiers default to [Alt]");
         assert_eq!(c.drag_threshold_px, 5);
         assert_eq!(c.double_click_ms, None);
-        assert!(!c.default_strategy.is_empty());
         assert!(c.native_excluded.is_empty());
-        assert!(c.fallback_apps.is_empty());
     }
 
     #[test]
@@ -295,7 +286,6 @@ mod tests {
         let path = dir.join("config.json");
         let mut c = Config::default();
         c.native_excluded.push("notepad.exe".into());
-        c.fallback_apps.push("msedge.exe".into());
         c.double_click_ms = Some(350);
         save_to(&c, &path).unwrap();
         let back = load_from(&path);
@@ -334,7 +324,7 @@ mod tests {
         assert!(s1 > 0, "a saved file must have a usable mtime");
         // 确保 mtime 有可见变化（部分文件系统时间粒度较粗）。
         std::thread::sleep(Duration::from_millis(20));
-        c.default_strategy = "native".into();
+        c.drag_threshold_px = 9;
         save_to(&c, &path).unwrap();
         let s2 = std::fs::metadata(&path)
             .and_then(|m| m.modified())

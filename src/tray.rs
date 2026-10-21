@@ -3,7 +3,7 @@
 //! - 隐藏 **message-only 窗**（`RegisterClassExW` + `CreateWindowExW(WS_POPUP, HWND_MESSAGE)`）
 //!   作为托盘回调窗，收 `u32` 自定义消息 `TRAY_MSG = WM_APP + 100`；
 //! - `Shell_NotifyIconW(NIM_ADD)`：图标用 `LoadImageW(0, IDI_APPLICATION, …)`（不内嵌
-//!   资源文件，YAGNI——GOAL T3.3 原文）；
+//!   资源文件，YAGNI）；
 //! - **图标 = 启用状态反馈**（NIM_MODIFY）：启用 = IDI_APPLICATION + tip
 //!   "anydrag-win"；禁用 = IDI_QUESTION（蓝圈问号）+ tip "anydrag-win（已禁用）"——
 //!   不点开菜单也能一眼看出当前手势是否生效；
@@ -40,7 +40,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config;
 use crate::icon;
 
-/// 托盘回调消息（GOAL T3.3：`u32` 自定义 `WM_APP+100`）。
+/// 托盘回调消息（`u32` 自定义 `WM_APP+100`）。
 const TRAY_MSG: u32 = WM_APP + 100;
 /// 菜单命令 id。
 const MENU_TOGGLE: usize = 1;

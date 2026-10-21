@@ -1,14 +1,15 @@
 //! T3.2 — engine 线程：消费 `RING`、驱动纯函数状态机、执行 FFI 动作。
 //!
-//! 架构（GOAL §3/§4，三线程之"engine 线程"）：
+//! 架构（三线程之"engine 线程"）：
 //! - `run_in_thread(cfg)` 开 engine 线程（自己的 `GetMessageW` 泵），线程内先取
 //!   `GetCurrentThreadId()` 再 `hook::spawn(tid, &cfg.modifiers)` 绑定 hook 线程，
 //!   返回该 tid（调用方 main/托盘用它发 `WM_QUIT`）。
 //! - 收到 hook 的 `WM_APP` → `RING.drain` 批量取事件 → `DragState::feed` →
 //!   执行 `Vec<Action>`：
-//!   - `BeginNativeDrag` → `post_sys_command(hwnd, SC_DRAGMOVE)`（T2.3 spike 背书）；
-//!   - `SetPos{x,y}` 同一事件内**多条只执行最后一条**（fallback 合并，GOAL T3.2）；
-//!   - `Maximize`/`Restore` → syscommand；`End` → 状态回 Idle。
+//!   - `SetPos{x,y}` 同一事件内**多条只执行最后一条**（移动合并）；
+//!   - `Maximize`/`Restore` → `SetWindowPlacement`；`End` → 状态回 Idle。
+//!   - 拖动只有 `SetWindowPos` 一条路（native/SC_DRAGMOVE 通道已于 2026-10-21 移除，
+//!     见 AGENTS.md「已移除的设计」）。
 //!   - `enabled=false`：仍泵消息，但跳过 feed（状态恒 Idle）。
 //! - 消费者约定：本线程是 `RING` 唯一消费者（程序结构保证，非类型系统）；
 //!   静态只能拿到 `&self`，故走 `drain_impl`（`&self` 原子内核，T1.2 守恒测试
@@ -248,8 +249,8 @@ pub fn run(cfg: Arc<Config>) {
                 hook::set_mods(&live.all_vks());
                 if std::env::var_os("ANYDRAG_DEBUG").is_some() {
                     eprintln!(
-                        "[config] 已重载（file_changed={file_changed}）strategy={} mods={:?}",
-                        live.default_strategy, live.modifiers
+                        "[config] 已重载（file_changed={file_changed}）mods={:?}",
+                        live.modifiers
                     );
                 }
             }
@@ -331,7 +332,7 @@ pub fn run(cfg: Arc<Config>) {
                         }
                     }
                 } else if !matches!(state, DragState::Idle) {
-                    // 运行中被 Disable：状态回 Idle（GOAL"feed 恒 None"的清理语义）。
+                    // 运行中被 Disable：状态回 Idle（"feed 恒 None"的清理语义）。
                     state = DragState::Idle;
                 }
             }
@@ -357,7 +358,6 @@ fn state_name(s: &DragState) -> &'static str {
         DragState::Idle => "Idle",
         DragState::Armed { .. } => "Armed",
         DragState::ArmedResize { .. } => "ArmedResize",
-        DragState::Native { .. } => "Native",
         DragState::Fallback { .. } => "Fallback",
         DragState::Resize { .. } => "Resize",
         DragState::MiddleArmed { .. } => "MiddleArmed",
@@ -368,7 +368,6 @@ fn state_name(s: &DragState) -> &'static str {
 fn gesture_hwnd(s: &DragState) -> Option<isize> {
     match s {
         DragState::Armed { target, .. }
-        | DragState::Native { target }
         | DragState::Fallback { target, .. }
         | DragState::ArmedResize { target, .. }
         | DragState::Resize { target, .. }
@@ -399,7 +398,6 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>,
     // 动作执行需要的目标 hwnd：feed 会改状态（如双击 Armed→Idle），故**先**快照。
     let pre_hwnd: Option<isize> = match state {
         DragState::Armed { target, .. }
-        | DragState::Native { target }
         | DragState::Fallback { target, .. }
         | DragState::ArmedResize { target, .. }
         | DragState::Resize { target, .. }
@@ -439,7 +437,7 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>,
         );
     }
 
-    // 合并：同一事件内多条 SetPos / SetRect 各只执行最后一条（GOAL T3.2 执行规则）。
+    // 合并：同一事件内多条 SetPos / SetRect 各只执行最后一条。
     let mut last_setpos: Option<(i32, i32)> = None;
     let mut last_setrect: Option<(i32, i32, i32, i32, u8)> = None;
     // 本手势是否真的做了事（移动/缩放/最大化/还原）。用于在**手势真正收尾（鼠标抬起）**
@@ -452,22 +450,6 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>,
     for a in actions {
         match a {
             Action::None => {}
-            Action::BeginNativeDrag => {
-                if let Some(h) = pre_hwnd {
-                    winmod::post_sys_command(h, winmod::SC_DRAGMOVE);
-                    // **失效告警（2026-10-21 用户报障："Alt 完全拖不动"）**：
-                    // native 走 PostMessage(SC_DRAGMOVE)，让目标应用自己跑 caption
-                    // 拖动循环。spike 实测它在 notepad 等应用上**直接无效**（dx=0），
-                    // 只有 explorer 之类有效——且失败时**毫无报错**，用户只看到"拖不动"。
-                    // 这里在下发后打一条一次性提示（仅 debug），把"静默失效"变成可诊断。
-                    if std::env::var_os("ANYDRAG_DEBUG").is_some() {
-                        eprintln!(
-                            "[native] 已发 SC_DRAGMOVE 给 0x{h:x}；若窗口不跟随，说明该应用                             不支持 native 通道（spike 实测 notepad 即如此）——                             请把 default_strategy 改为 fallback，或把该 exe 加入 fallback_apps"
-                        );
-                    }
-                }
-                gesture_done = true;
-            }
             // 尺寸调整相位（成对）：目标应用据此把重排推迟到相位结束——
             // 缩放顺滑的关键配套，见 winmod::WM_ENTERSIZEMOVE 常量注释。
             Action::BeginSizeMove => {
@@ -504,7 +486,7 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>,
             }
             Action::End => {
                 // End 是"相位结束"通知：feed 已把正确的下一状态提交进 `state`
-                // （Up 后保留 Armed = 双击记忆 / 双击后 Idle / 提交后 Native），
+                // （Up 后保留 Armed = 双击记忆 / 双击后 Idle / 提交后 Fallback），
                 // 执行器**不得**在此重置——否则 Up[End] 会抹掉双击记忆，
                 // Down/Up/Down 生产手势永远判不出双击（2026-10-15 冒烟实测：
                 // 四个 Down 全 [None]，窗口纹丝不动，根因即此）。
@@ -529,7 +511,7 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>,
         }
     }
     // 几何更新**不在这里落地**——交给 run() 的节流器（见 `Geom` 注释）：
-    // 同一事件内多条只保留最后一条（合并，GOAL T3.2）。
+    // 同一事件内多条只保留最后一条（合并）。
     match (last_setpos, last_setrect) {
         (_, Some((x, y, w, h, _edges))) => (Some(Geom::Rect { x, y, w, h }), pre_hwnd),
         (Some((x, y)), None) => (Some(Geom::Pos { x, y }), pre_hwnd),

@@ -24,10 +24,6 @@ windows-sys = { version = "0.61", features = [
 serde     = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[[bin]]
-name = "probe_scandrag"
-path = "src/bin/probe_scandrag.rs"
-
 [profile.release]
 panic = "abort"
 lto = true

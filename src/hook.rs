@@ -1,9 +1,9 @@
 //! T3.1 — `WH_MOUSE_LL` 低级鼠标钩子 + 钩子线程消息泵。
 //!
-//! 架构（GOAL §3/§4，三线程之"hook 线程"）：
+//! 架构（三线程之"hook 线程"）：
 //! - `spawn(engine_tid, mods)` 开钩子线程：`SetWindowsHookExW(WH_MOUSE_LL, …)` +
 //!   自己的 `GetMessageW` 泵（线程活着 LL 钩子才持续生效）；
-//! - `ll_proc` 回调 **O(1)、无堆分配、无阻塞**（GOAL 不变量）：
+//! - `ll_proc` 回调 **O(1)、无堆分配、无阻塞**（AGENTS.md §1 不变量）：
 //!   仅当 `code >= 0` 且消息 ∈ {WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE} 时
 //!   读 `MSLLHOOKSTRUCT`，用 `GetAsyncKeyState` 读配置 VK 组装 `mods` mask
 //!   （bit = `VK & 0x1F`，与 mods.rs / engine.rs 的 u32 扩展约定一致），
@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::engine::EngineEvent;
 use crate::ring::Ring;
 
-/// 环容量（GOAL T1.2/§5：生产者 = hook 线程，消费者 = engine 线程）。
+/// 环容量（生产者 = hook 线程，消费者 = engine 线程）。
 ///
 /// **为什么从 64 扩到 512（2026-10-21）**：`WH_MOUSE_LL` 按鼠标硬件率推事件，
 /// 实测注入 4183 次/秒时 64 槽环在消费端一批 `SetWindowPos + sync_paint` 的
@@ -118,10 +118,9 @@ pub fn is_installed() -> bool {
 /// 启动 hook 线程。回调把命中事件推入 `RING` 并以 `PostThreadMessageW(engine_tid, WM_APP)`
 /// 唤醒 engine 线程。
 ///
-/// **签名偏差注记（对 GOAL T3.1 原文 `spawn() -> engine_tid`）**：钩子线程必须**先知道**
-/// engine 线程 tid 才能向它发 `PostThreadMessage`，tid 因此是入参而非返回值
-/// （engine 线程由 T3.2 `engine_loop::run_in_thread` 创建，spawn 钩子线程时传入）。
-/// GOAL 原句按"spawn 使回调绑定到一个 engine_tid"解读，语义不变。
+/// **签名注记**：钩子线程必须**先知道** engine 线程 tid 才能向它发
+/// `PostThreadMessage`，tid 因此是入参而非返回值（engine 线程由
+/// `engine_loop::run_in_thread` 创建，spawn 钩子线程时传入）。
 pub fn spawn(engine_tid: u32, mods: &[u16]) -> std::thread::JoinHandle<()> {
     set_mods(mods);
     ENGINE_TID.store(engine_tid, Ordering::Release);
@@ -156,7 +155,7 @@ fn hook_thread() {
     }
 }
 
-/// LL 回调（`unsafe extern "system"` = stdcall）。**不得堆分配/阻塞**（GOAL 不变量）：
+/// LL 回调（`unsafe extern "system"` = stdcall）。**不得堆分配/阻塞**：
 /// 读指针 + 若干原子读 + 有界自旋 push + 一条 PostThreadMessage，全部 O(1)。
 ///
 /// windows-sys 0.61 约定：`WPARAM = usize`、`LPARAM = isize`、`LRESULT = isize`。

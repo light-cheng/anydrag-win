@@ -1,4 +1,4 @@
-//! T3.4 — main 接线（GOAL 原文）+ 三线程拓扑：
+//! main 接线 + 三线程拓扑（架构见 AGENTS.md §1）：
 //! main（DPI 感知 + 托盘泵）/ engine（ring 消费 + 状态机 + FFI 动作）/
 //! hook（WH_MOUSE_LL，O(1) 回调塞 ring + PostThreadMessage）。
 
@@ -25,7 +25,7 @@ mod tray;
 mod winmod;
 
 fn main() {
-    winmod::dpi_aware_v2(); // 必须是第一个 FFI 调用（GOAL 不变量 1）
+    winmod::dpi_aware_v2(); // 必须是第一个 FFI 调用（AGENTS.md §1 不变量 1）
     // 先装入全局配置存放点：设置界面保存后靠它做**热重载**（见 config::STORE 注释）。
     config::init(config::load());
     let cfg = std::sync::Arc::new(config::snapshot());

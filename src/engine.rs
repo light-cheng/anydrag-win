@@ -1,7 +1,7 @@
 //! 拖动状态机（项目大脑，纯逻辑，零 windows-sys）。
 //!
 //! `feed` 每事件产出一组 `Action`，由 engine 线程（T3.2）执行 FFI。
-//! 规则逐条注释，单测逐条钉死（`engine_*` + GOAL 示例测试）。
+//! 规则逐条注释，单测逐条钉死（`engine_*`）。
 
 use std::time::Instant;
 
@@ -9,30 +9,19 @@ use std::time::Instant;
 /// - `frame`：DWM 可见几何 L,T,R,B（物理像素，Per-Monitor-v2 下统一坐标系）。
 /// - `is_maximized`：由 resolve 判定（MVP 简化：frame == 所属 monitor 工作区，见 winmod）。
 ///   双击时用它决定发 SC_MAXIMIZE 还是 SC_RESTORE。
-/// - `strategy`：按应用的选择（fallback_apps 命中 → Fallback，否则 cfg.default_strategy；
-///   native_excluded 命中 → resolve 直接返回 None，不进状态机）。
+/// - `native_excluded` 命中 → resolve 直接返回 None，不进状态机。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub hwnd: isize,
     pub exe: String,
     pub frame: [i32; 4],
     pub is_maximized: bool,
-    pub strategy: Strategy,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Strategy {
-    Native,
-    Fallback,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// 本事件无动作（占位：每个事件至少返回一条，执行器按"恒有输出"处理）。
     None,
-    /// → `PostMessage(hwnd, WM_SYSCOMMAND, SC_DRAGMOVE=0xF012, 0)`，目标应用自己的泵
-    ///   跑原生 caption 拖动循环（spike T2.3 验证过才默认启用）。
-    BeginNativeDrag,
     /// → `PostMessage(hwnd, WM_ENTERSIZEMOVE)`：进入尺寸调整相位。
     ///   目标应用据此把重排推迟到相位结束（AltSnap `hooks.c:580-591` 手法）。
     ///   **必须与 `EndSizeMove` 成对**，否则应用永久停在尺寸调整态（卡顿根因）。
@@ -68,8 +57,10 @@ pub enum EngineEvent {
 
 /// 状态机持有的状态。
 /// - `Armed`：已按下且修饰齐全，等"位移≥阈值 → 提交拖动"或"500ms 内第二次 Down 无位移 → 双击"。
-/// - `Native`/`Fallback`：已提交的拖动进行中（Native 下窗口跟随由目标应用负责，
-///   本状态机只等待 Up 收尾；Fallback 下每个 Move 产出一条 SetPos）。
+/// - `Fallback`：已提交的拖动进行中，每个 Move 产出一条 SetPos。
+///   （2026-10-21 删除 native 拖动策略前这里还有 `Native` 态：窗口跟随交给目标应用的
+///   caption 拖动循环。实测该通道只在 explorer/mspaint 等部分应用生效，其余完全拖不动，
+///   而 fallback 对**所有**应用都生效，故整条移除，见 AGENTS.md「已移除的设计」。）
 /// `down_seq`：同目标连续 Down 计数（=1 时可升级为双击）。
 /// `armed_at`/`start`：双击窗口与位移基准（Fallback 的 SetPos 也需要 `start`，故扩展进状态）。
 pub enum DragState {
@@ -78,7 +69,6 @@ pub enum DragState {
         target: Target,
         start: [i32; 2],
         down_seq: u8,
-        strategy: Strategy,
         armed_at: Instant,
     },
     /// resize 手势已按下、未达位移阈值（触发键组合 = `cfg.resize_mask`，默认 Alt+Ctrl；
@@ -86,9 +76,6 @@ pub enum DragState {
     ArmedResize {
         target: Target,
         start: [i32; 2],
-    },
-    Native {
-        target: Target,
     },
     Fallback {
         target: Target,
@@ -111,7 +98,7 @@ pub enum DragState {
 /// 状态机每次 feed 的配置快照（engine 线程从共享 Config 现取现算，
 /// 所以 `enabled=false` 的短路发生在调用方：不调 feed 即恒 None）。
 /// `modifiers_mask` 为 u32（位规则 `VK & 0x1F` 产生 bit 16..30，u16 装不下，
-/// 见 mods.rs 模块注记——对 GOAL 标注的有意偏差）。
+/// 见 mods.rs 模块注记——对早期 GOAL 标注的有意偏差）。
 #[derive(Clone, Copy, Debug)]
 pub struct EngineCfg {
     /// 触发所需的修饰键 mask（bit = `VK & 0x1F`，见 mods.rs）。
@@ -387,7 +374,6 @@ impl DragState {
                     target: target.clone(),
                     start: [*x, *y],
                     down_seq: 1,
-                    strategy: target.strategy,
                     armed_at: Instant::now(),
                 };
                 vec![Action::None]
@@ -400,7 +386,6 @@ impl DragState {
                     DragState::Armed {
                         target,
                         start,
-                        strategy,
                         armed_at,
                         ..
                     } => {
@@ -416,31 +401,21 @@ impl DragState {
                             // 未达阈值：仍是"等待双击"，无动作。
                             (vec![Action::None], None)
                         } else {
-                            // 规则 3：位移 ≥ 阈值 → 按策略提交。
-                            match strategy {
-                                Strategy::Native => (
-                                    // End 仅表示"armed 阶段结束"，进入 Native 态。
-                                    vec![Action::BeginNativeDrag, Action::End],
-                                    Some(DragState::Native {
-                                        target: target.clone(),
-                                    }),
-                                ),
-                                Strategy::Fallback => (
-                                    // 规则 3/4：SetPos = 起点帧 + 位移。
-                                    // 首帧同时开尺寸调整相位（目标应用据此把重排推迟到 Up）。
-                                    vec![
-                                        Action::BeginSizeMove,
-                                        Action::SetPos {
-                                            x: target.frame[0] + (*x - start[0]),
-                                            y: target.frame[1] + (*y - start[1]),
-                                        },
-                                    ],
-                                    Some(DragState::Fallback {
-                                        target: target.clone(),
-                                        start: *start,
-                                    }),
-                                ),
-                            }
+                            // 规则 3/4：SetPos = 起点帧 + 位移，进 Fallback 态。
+                            // 首帧同时开尺寸调整相位（目标应用据此把重排推迟到 Up）。
+                            (
+                                vec![
+                                    Action::BeginSizeMove,
+                                    Action::SetPos {
+                                        x: target.frame[0] + (*x - start[0]),
+                                        y: target.frame[1] + (*y - start[1]),
+                                    },
+                                ],
+                                Some(DragState::Fallback {
+                                    target: target.clone(),
+                                    start: *start,
+                                }),
+                            )
                         }
                     }
                     // 规则 4：Fallback 态每个 Move 出一条 SetPos（相对 start 累计；
@@ -498,7 +473,7 @@ impl DragState {
                             None,
                         )
                     }
-                    // 规则 4 的 Native 侧：拖动循环在目标应用内部，状态机无动作。
+                    // Fallback 态每个 Move 都产出一条 SetPos（见上一个臂）。
                     _ => (vec![Action::None], None),
                 };
                 if let Some(next) = outcome.1 {
@@ -508,12 +483,12 @@ impl DragState {
             }
 
             // 规则 5：任意 Up → [End]。
-            // 已提交的拖动（Native/Fallback）与 Idle → 回 Idle。
+            // 已提交的拖动（Fallback）与 Idle → 回 Idle。
             // 特殊：未提交的 Armed（一次无位移的"单击"）→ 保留 Armed——
             // 真实双击事件流是 Down/Up/Down/Up，若 Up 也回 Idle，第二次 Down
-            // 到达时状态机已失忆，双击永远不可达（GOAL 规则 5 的字面写法会在
+            // 到达时状态机已失忆，双击永远不可达（规则 5 的字面写法会在
             // 生产手势下杀死双击；此处按"Up 结束本 click 相位、保留双击记忆"实现，
-            // GOAL 示例测试（连续 Down/Down）与此语义兼容）。
+            // 早期 GOAL 的示例测试（连续 Down/Down）与此语义兼容）。
             EngineEvent::Up { .. } => {
                 // 已提交的移动/缩放相位 → 先关尺寸调整相位（与提交时的 BeginSizeMove 成对），
                 // 应用在这一刻做最终重排。
@@ -582,7 +557,7 @@ mod tests {
 
     impl EngineCfg {
         /// 测试固定配置：Alt 触发、阈值 5px、双击窗 500ms、resize 路径关闭
-        /// （`resize_mask=0` ⇒ GOAL 原示例测试逐字不变；resize 专项测试用
+        /// （`resize_mask=0` ⇒ 早期 GOAL 的原示例测试逐字不变；resize 专项测试用
         /// `cfg_resize()` 打开 Ctrl 路径）。
         pub fn test() -> Self {
             Self {
@@ -604,7 +579,6 @@ mod tests {
                 exe: "notepad.exe".into(),
                 frame: [100, 100, 900, 700],
                 is_maximized,
-                strategy: Strategy::Native,
             }
         }
     }
@@ -621,19 +595,11 @@ mod tests {
     fn resolve_ok(maximized: bool) -> impl Fn(i32, i32) -> Option<Target> {
         move |_x, _y| Some(Target::test_notepad(maximized))
     }
-    fn resolve_fallback() -> impl Fn(i32, i32) -> Option<Target> {
-        move |_x, _y| {
-            Some(Target {
-                strategy: Strategy::Fallback,
-                ..Target::test_notepad(false)
-            })
-        }
-    }
     fn resolve_none() -> impl Fn(i32, i32) -> Option<Target> {
         move |_x, _y| None
     }
 
-    /// GOAL 示例（逐字保留）：双 Down 无位移 → 最大化。
+    /// 早期 GOAL 示例（逐字保留）：双 Down 无位移 → 最大化。
     #[test]
     fn double_down_no_motion_maximizes() {
         let mut s = DragState::Idle;
@@ -718,23 +684,12 @@ mod tests {
     }
 
     #[test]
-    fn engine_move_commits_native() {
-        // 规则 3：位移 ≥ 阈值 + Native 策略 → [BeginNativeDrag, End]，进 Native 态。
-        let mut s = DragState::Idle;
-        let cfg = EngineCfg::test();
-        s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
-        let a = s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg);
-        assert_eq!(a, vec![Action::BeginNativeDrag, Action::End]);
-        assert!(matches!(s, DragState::Native { .. }));
-    }
-
-    #[test]
     fn engine_move_commits_fallback_with_setpos() {
         // 规则 3：位移 ≥ 阈值 + Fallback 策略 → 一条 SetPos（frame + 位移），进 Fallback 态。
         let mut s = DragState::Idle;
         let cfg = EngineCfg::test();
-        s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
-        let a = s.feed(&move_(106, 203, MOD_ALT), &resolve_fallback(), &cfg);
+        s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
+        let a = s.feed(&move_(106, 203, MOD_ALT), &resolve_ok(false), &cfg);
         // frame L,T = 100,100；位移 +6,+3 → 106,103。
         // 首帧同时开尺寸调整相位（BeginSizeMove），见 Action 注释。
         assert_eq!(a, vec![Action::BeginSizeMove, Action::SetPos { x: 106, y: 103 }]);
@@ -747,18 +702,18 @@ mod tests {
         // 非增量）；执行器对同事件多条只应用最后一条。
         let mut s = DragState::Idle;
         let cfg = EngineCfg::test();
-        s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
-        s.feed(&move_(106, 200, MOD_ALT), &resolve_fallback(), &cfg); // 提交
-        let a1 = s.feed(&move_(140, 230, MOD_ALT), &resolve_fallback(), &cfg);
+        s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
+        s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg); // 提交
+        let a1 = s.feed(&move_(140, 230, MOD_ALT), &resolve_ok(false), &cfg);
         assert_eq!(a1, vec![Action::SetPos { x: 100 + 40, y: 100 + 30 }]);
         // 后续 Move 仍相对 start(100,200)：+60,+45。
-        let a2 = s.feed(&move_(160, 245, MOD_ALT), &resolve_fallback(), &cfg);
+        let a2 = s.feed(&move_(160, 245, MOD_ALT), &resolve_ok(false), &cfg);
         assert_eq!(a2, vec![Action::SetPos { x: 100 + 60, y: 100 + 45 }]);
     }
 
     #[test]
     fn engine_up_ends_and_resets() {
-        // 规则 5：任意 Up → [End]。Native/Fallback/Idle → 回 Idle；
+        // 规则 5：任意 Up → [End]。Fallback/Idle → 回 Idle；
         // 未提交的 Armed（无位移单击）→ 保留 Armed 作双击记忆（feed 注释）。
         let cfg = EngineCfg::test();
 
@@ -776,16 +731,22 @@ mod tests {
 
         let mut s = DragState::Idle;
         s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
-        s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg); // → Native
-        assert_eq!(s.feed(&up(110, 200, MOD_ALT), &resolve_ok(false), &cfg), vec![Action::End]);
+        s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg); // → Fallback
+        // Fallback 态 Up 必须先关尺寸调整相位（与提交时的 BeginSizeMove 成对），再 End。
+        // 删掉 native 策略前这里是 Native 态，Up 只发 End——那是 native 通道的语义，
+        // 与 SetWindowPos 路径无关。
+        assert_eq!(
+            s.feed(&up(110, 200, MOD_ALT), &resolve_ok(false), &cfg),
+            vec![Action::EndSizeMove, Action::End]
+        );
         assert!(matches!(s, DragState::Idle));
 
         let mut s = DragState::Idle;
-        s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
-        s.feed(&move_(106, 200, MOD_ALT), &resolve_fallback(), &cfg); // → Fallback
-        s.feed(&move_(120, 200, MOD_ALT), &resolve_fallback(), &cfg);
+        s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
+        s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg); // → Fallback
+        s.feed(&move_(120, 200, MOD_ALT), &resolve_ok(false), &cfg);
         assert_eq!(
-            s.feed(&up(120, 200, MOD_ALT), &resolve_fallback(), &cfg),
+            s.feed(&up(120, 200, MOD_ALT), &resolve_ok(false), &cfg),
             vec![Action::EndSizeMove, Action::End],
             "committed move must close the size-move phase it opened"
         );
@@ -815,27 +776,23 @@ mod tests {
     }
 
     #[test]
-    fn engine_moves_while_idle_or_native_are_noops() {
-        // 规则 1/4：Idle 态的 Move 无事可做；Native 态的 Move 交给目标应用的拖动循环。
+    fn engine_moves_while_idle_are_noops() {
+        // 规则 1：Idle 态的 Move 无事可做（Fallback 态由上一个测试覆盖）。
         let mut s = DragState::Idle;
         let cfg = EngineCfg::test();
         assert_eq!(s.feed(&move_(5, 5, MOD_ALT), &resolve_ok(false), &cfg), vec![Action::None]);
-        s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
-        s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg); // → Native
-        assert_eq!(s.feed(&move_(110, 200, MOD_ALT), &resolve_ok(false), &cfg), vec![Action::None]);
-        assert!(matches!(s, DragState::Native { .. }));
+        assert!(matches!(s, DragState::Idle));
     }
 
     // ===== resize（独立触发键 Ctrl = bit17；边带 10px）=====
 
     fn target_rz() -> Target {
-        // frame [100,100,500,400]（400×300），非最大化，Fallback。
+        // frame [100,100,500,400]（400×300），非最大化。
         Target {
             hwnd: 0x77,
             exe: "notepad.exe".into(),
             frame: [100, 100, 500, 400],
             is_maximized: false,
-            strategy: Strategy::Fallback,
         }
     }
     fn resolve_rz() -> impl Fn(i32, i32) -> Option<Target> {
@@ -1039,11 +996,11 @@ mod tests {
         // BeginSizeMove 只在提交那一帧出现一次；后续 Move 只产 SetPos（不重复开相位）。
         let mut s = DragState::Idle;
         let cfg = EngineCfg::test();
-        s.feed(&down(100, 200, MOD_ALT), &resolve_fallback(), &cfg);
-        let a1 = s.feed(&move_(106, 200, MOD_ALT), &resolve_fallback(), &cfg);
+        s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg);
+        let a1 = s.feed(&move_(106, 200, MOD_ALT), &resolve_ok(false), &cfg);
         assert_eq!(a1[0], Action::BeginSizeMove);
         assert_eq!(a1.len(), 2, "commit frame = BeginSizeMove + SetPos");
-        let a2 = s.feed(&move_(120, 200, MOD_ALT), &resolve_fallback(), &cfg);
+        let a2 = s.feed(&move_(120, 200, MOD_ALT), &resolve_ok(false), &cfg);
         assert_eq!(a2, vec![Action::SetPos { x: 120, y: 100 }]);
     }
 

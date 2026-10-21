@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowTextLengthW,
     GetWindowTextW, IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
     SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CW_USEDEFAULT,
+    BS_PUSHBUTTON, CW_USEDEFAULT,
     ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, IDC_ARROW, SW_SHOW, WM_CLOSE,
     WM_COMMAND, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_SETFONT, WNDCLASSEXW,
     WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
@@ -212,9 +212,7 @@ struct Ctls {
     dbl: isize,
     mid_on: isize,
     mid_thr: isize,
-    strategy: isize,
     excl: isize,
-    fallback: isize,
 }
 
 const ZERO: Ctls = Ctls {
@@ -230,9 +228,7 @@ const ZERO: Ctls = Ctls {
     dbl: 0,
     mid_on: 0,
     mid_thr: 0,
-    strategy: 0,
     excl: 0,
-    fallback: 0,
 };
 
 static CTL: Mutex<Ctls> = Mutex::new(ZERO);
@@ -470,24 +466,9 @@ unsafe fn create_controls(parent: HWND) {
     c.mid_on = check("启用", 168, 234, 76);
     label("判定阈值(px)", 260, 236, 110);
     c.mid_thr = edit1(378, 234, 90);
-    label("默认拖动通道", 30, 274, 130);
-    c.strategy = mk(
-        "COMBOBOX",
-        "",
-        CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-        0,
-        168,
-        272,
-        260,
-        220,
-        0,
-    );
-
     // ── 卡片三：进程名单 ────────────────────────────
-    label("完全无视手势的进程：", 30, 358, 300);
-    c.excl = editn(30, 384, 560, 76);
-    label("强制走 fallback 通道的进程：", 30, 476, 300);
-    c.fallback = editn(30, 502, 560, 76);
+    label("完全无视手势的进程（一行一个，如 game.exe）：", 30, 290, 380);
+    c.excl = editn(30, 316, 560, 110);
 
     // ── 底部按钮区 ──────────────────────────────────
     HINT_HWND.store(
@@ -498,20 +479,6 @@ unsafe fn create_controls(parent: HWND) {
     mk("BUTTON", "取消", BS_PUSHBUTTON as u32, 0, 452, 602, 110, 34, ID_CANCEL);
 
     *CTL.lock().unwrap() = c;
-
-    // 下拉框内容（COMBOBOX 的字符串必须在控件建好后加）。
-    // 文案必须如实反映实测结论（docs/spike-scandrag.md）：native 走
-    // PostMessage(SC_DRAGMOVE)，让目标应用自己跑 caption 拖动循环——**在 notepad 等
-    // 应用上直接失效**（spike 实测 dx=0），只有 explorer 这类有效。旧文案写"更顺滑"
-    // 会诱导用户选中它，然后"Alt 完全拖不动"（2026-10-21 用户报障即此）。
-    let items = [
-        "fallback（SetWindowPos，兼容性最好，推荐）",
-        "native（原生拖动循环；仅部分应用有效，可能完全拖不动）",
-    ];
-    for it in items.iter() {
-        let t = wstr(it);
-        SendMessageW(c.strategy as HWND, CB_ADDSTRING, 0, t.as_ptr() as isize);
-    }
 }
 
 /// 把当前生效配置灌进控件（打开窗口时调用）。
@@ -541,9 +508,6 @@ unsafe fn populate(_hwnd: HWND) {
     );
     set_text(c.mid_thr, &cfg.middle_snap_threshold_px.to_string());
     set_text(c.excl, &cfg.native_excluded.join("\r\n"));
-    set_text(c.fallback, &cfg.fallback_apps.join("\r\n"));
-    let sel = if cfg.default_strategy == "native" { 1 } else { 0 };
-    SendMessageW(c.strategy as HWND, CB_SETCURSEL, sel, 0);
 }
 
 /// 读控件 → 组装新配置。以磁盘值为基底，保留本界面不编辑的字段（如 enabled）。
@@ -563,13 +527,7 @@ fn collect() -> config::Config {
         };
         cfg.middle_snap = is_checked(c.mid_on);
         cfg.middle_snap_threshold_px = text_of(c.mid_thr).trim().parse().unwrap_or(40);
-        cfg.default_strategy = if combo_sel(c.strategy) == 1 {
-            "native".into()
-        } else {
-            "fallback".into()
-        };
         cfg.native_excluded = parse_list(&text_of(c.excl));
-        cfg.fallback_apps = parse_list(&text_of(c.fallback));
         cfg
     }
 }
@@ -605,13 +563,6 @@ fn parse_list(text: &str) -> Vec<String> {
 
 unsafe fn is_checked(h: isize) -> bool {
     h != 0 && SendMessageW(h as HWND, BM_GETCHECK, 0, 0) as usize == BST_CHECKED_V
-}
-
-unsafe fn combo_sel(h: isize) -> isize {
-    if h == 0 {
-        return 0;
-    }
-    SendMessageW(h as HWND, CB_GETCURSEL, 0, 0)
 }
 
 unsafe fn text_of(h: isize) -> String {

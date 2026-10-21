@@ -9,7 +9,7 @@
 //! 后得到 bit 16/17/18/0/3/5…… 左侧/右侧修饰键与基础码会落到不同 bit，
 //! MVP 按"配置哪个 VK 就检查哪个 bit"处理（配置 [0x12] = 只认 MENU 位）。
 //!
-//! **类型注记（对 GOAL 的偏差，编译器证实）**：GOAL T1.3/T1.4 标注
+//! **类型注记（对早期 GOAL 的偏差，编译器证实）**：早期 GOAL 曾标注
 //! `down_mask: u16`，但其自己的位规则 `VK & 0x1F` 对 Alt(0x12) 产生 bit 18，
 //! u16（bit 0..15）装不下——const 求值直接报 E0080。故 mask 全线加宽为 u32
 //! （bit 规则本身不变，仍是 `VK & 0x1F`）。
@@ -31,7 +31,7 @@ pub fn matches(down_mask: u32, required: &[u16]) -> bool {
 mod tests {
     use super::*;
 
-    // 按 GOAL 位规则：bit 索引 = VK & 0x1F。
+    // 位规则：bit 索引 = VK & 0x1F。
     // Alt (VK 0x12) → bit 18；Ctrl (0x11) → bit 17；Shift (0x10) → bit 16。
     const ALT: u32 = 1u32 << 18;
     const CTRL: u32 = 1u32 << 17;
