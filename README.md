@@ -125,6 +125,11 @@ cmd /c "build.bat"     # release 构建
 ### 图标
 
 - **托盘图标**：运行时自绘（`src/icon.rs`），不依赖资源文件；配色即状态（蓝=启用，灰=禁用）。
-- **exe 文件图标**：内嵌进 PE 资源段（`assets/anydrag-win.ico` + `assets/app.rc`）。
-  `build.rs` 调 Windows SDK 的 `rc.exe` 编译后经 `cargo:rustc-link-arg` 交给链接器，
-  **不引入任何 Rust 构建依赖**（不用 winres/embed-resource）。找不到 rc.exe 只警告不失败。
+- **exe 文件图标 + 视觉样式清单**：都内嵌进 PE 资源段（`assets/anydrag-win.ico` +
+  `assets/app.rc`）。`build.rs` 调 Windows SDK 的 `rc.exe` 编译后经
+  `cargo:rustc-link-arg` 交给链接器，**不引入任何 Rust 构建依赖**
+  （不用 winres/embed-resource）。找不到 rc.exe 只警告不失败。
+
+  因此 **exe 是单文件可分发**：不再需要旁边的 `anydrag-win.exe.manifest`。
+  清单以 `RT_MANIFEST` / ID=1（进程级）内嵌；若退回外部文件模式，一旦漏拷就会
+  静默退回 Windows 95 灰色控件样式且无任何报错。
