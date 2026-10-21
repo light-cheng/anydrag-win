@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
@@ -27,14 +28,17 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowTextLengthW,
-    GetWindowTextW, IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, IDC_ARROW, SW_SHOW, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_SETFONT, WNDCLASSEXW,
-    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GetClientRect,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, IsWindow, IsWindowVisible, LoadCursorW,
+    RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, BM_GETCHECK,
+    BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, IDCANCEL, IDC_ARROW, SW_SHOW,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_SETFONT,
+    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    // ListBox（进程选择弹窗用）：多选 + 系统原生选中态，省掉自绘 owner-draw 列表。
+    GWL_EXSTYLE, LB_ADDSTRING, LB_ERR, LB_GETCOUNT, LB_GETSEL, LB_GETTEXT, LB_GETTEXTLEN,
+    LB_SETSEL, LBS_HASSTRINGS, LBS_MULTIPLESEL, LBS_NOTIFY,
 };
 
 use crate::config;
@@ -49,12 +53,27 @@ fn rgb(r: u8, g: u8, b: u8) -> u32 {
 
 const ID_SAVE: usize = 1;
 const ID_CANCEL: usize = 2;
+/// 设置窗口内「选择进程…」按钮。
+const ID_PICK_PROCS: usize = 3;
+/// 进程选择弹窗内的控件/按钮。
+const ID_PROC_LIST: usize = 10;
+const ID_PROC_OK: usize = 11;
 
 /// 设置窗口句柄（0 = 未打开）。只允许一个实例。
 static WIN: AtomicIsize = AtomicIsize::new(0);
 
 /// 底部灰色提示控件句柄（WM_CTLCOLORSTATIC 里给它上灰色文字）。
 static HINT_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 进程选择弹窗的父窗口（设置窗口）句柄；None = 未打开。
+///
+/// **ListBox 句柄为什么单独放一个静态**：`CreateWindowExW` 会**同步**触发
+/// `WM_CREATE`，而此时外层还没执行到"把弹窗句柄存进 PROC_PICK"那一步——
+/// 第一版在 WM_CREATE 里写 `PROC_PICK` 的 `Some((_, lb))`，结果永远写不进去，
+/// `lb` 恒为 0，点"确定"时 `apply_proc_selection` 直接 return，名单纹丝不动。
+/// 拆成两个静态后 WM_CREATE 只管写自己那个，没有时序依赖。
+static PROC_PICK: Mutex<Option<isize>> = Mutex::new(None);
+static PROC_LIST: AtomicIsize = AtomicIsize::new(0);
 
 // ── Win11 DWM 现代窗口效果常量（未文档化但数十年稳定的属性 id）──
 /// DWMWA_USE_IMMERSIVE_DARK_MODE：标题栏明暗（Win10 1809+）。
@@ -321,6 +340,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_COMMAND => {
             match wp & 0xFFFF {
+                ID_PICK_PROCS => open_proc_picker(),
                 ID_SAVE => {
                     let cfg = collect();
                     // 热重载：engine 线程下一个事件批次就会用新值；同时写盘持久化。
@@ -467,7 +487,21 @@ unsafe fn create_controls(parent: HWND) {
     label("判定阈值(px)", 260, 236, 110);
     c.mid_thr = edit1(378, 234, 90);
     // ── 卡片三：进程名单 ────────────────────────────
-    label("完全无视手势的进程（一行一个，如 game.exe）：", 30, 290, 380);
+    label("完全无视手势的进程：", 30, 290, 300);
+    // 「选择进程…」：列出当前可见窗口勾选，用户不必去猜 exe 名称
+    // （2026-10-21 用户反馈：手填 exe 名等于不可用）。下面的多行框保留给
+    // 高级用法——手填当前没开着的进程（如没启动的游戏）。
+    mk(
+        "BUTTON",
+        "选择进程…",
+        BS_PUSHBUTTON as u32,
+        0,
+        420,
+        288,
+        110,
+        26,
+        ID_PICK_PROCS,
+    );
     c.excl = editn(30, 316, 560, 110);
 
     // ── 底部按钮区 ──────────────────────────────────
@@ -481,6 +515,317 @@ unsafe fn create_controls(parent: HWND) {
     *CTL.lock().unwrap() = c;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 进程选择弹窗
+//
+// **为什么要有它（2026-10-21 用户反馈）**：排除表原来只让用户手填 exe 名称
+// （"一行一个，如 game.exe"）。但用户不可能知道目标是 `msedge.exe` 还是
+// `MicrosoftEdge.exe`，也不会为了填一个名字去开任务管理器查——这个交互等于
+// 不可用。改成：点「选择进程…」→ 列出**当前所有可见窗口**（标题 + exe）→
+// 勾选 → 确定即写入名单。
+//
+// 实现取舍：用 **ListBox 多选**（`LBS_MULTIPLESEL`）而不是自绘复选框列表。
+// Win32 自绘 owner-draw 列表要处理 WM_DRAWITEM + 焦点框 + 高亮 + 键盘导航，
+// 几百行且容易出视觉 bug；ListBox 多选是系统原生行为，选中态/键盘/滚动全免费，
+// 视觉也与系统一致。代价是"已选项"不显示勾号而显示蓝色高亮——可接受。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// EnumWindows 的收集体（回调里不能分配/加锁以外的重活，故只存句柄）。
+static VIS_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// 当前可见窗口（弹窗 ListBox 的数据源）：(显示文本, exe 名)。
+/// exe 名取不到（提权进程等）的条目照样显示，但 exe 字段为空串。
+fn visible_windows() -> Vec<(String, String)> {
+    *VIS_HWNDS.lock().unwrap() = Vec::new();
+    unsafe {
+        EnumWindows(Some(collect_visible), 0);
+    }
+    let hwnds = std::mem::take(&mut *VIS_HWNDS.lock().unwrap());
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for h in hwnds {
+        let exe = crate::winmod::exe_name(h).unwrap_or_default();
+        // 同一 exe 的多个窗口只保留第一个（排除表按 exe 生效，列 N 个
+        // 相同 exe 只会让用户困惑）。
+        if !exe.is_empty() && seen.contains(&exe) {
+            continue;
+        }
+        let title = window_title(h);
+        // 标题与 exe 都为空 = 没什么可展示的（纯消息窗）。
+        if title.is_empty() && exe.is_empty() {
+            continue;
+        }
+        let shown = if title.is_empty() {
+            format!("（无标题）  [{exe}]")
+        } else {
+            format!("{title}  [{exe}]")
+        };
+        if !exe.is_empty() {
+            seen.push(exe.clone());
+        }
+        out.push((shown, exe));
+    }
+    // 按显示文本排序：稳定的列表顺序，用户第二次打开时条目不会乱跳。
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// EnumWindows 回调：只收"可见 + 非工具窗"的顶层窗。
+unsafe extern "system" fn collect_visible(hwnd: HWND, _lparam: isize) -> i32 {
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    // 过滤工具窗（WS_EX_TOOLWINDOW）：它们不该出现在用户可见列表里。
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex & WS_EX_TOOLWINDOW != 0 {
+        return 1;
+    }
+    // 自己的两个窗口不进列表（设置窗与弹窗本身，选了也没意义）。
+    if hwnd as isize == WIN.load(Ordering::Acquire) {
+        return 1;
+    }
+    if let Some(p) = *PROC_PICK.lock().unwrap() {
+        if p == hwnd as isize {
+            return 1;
+        }
+    }
+    VIS_HWNDS.lock().unwrap().push(hwnd as isize);
+    1
+}
+
+/// 窗口标题（取不到返回空串）。
+fn window_title(hwnd: isize) -> String {
+    unsafe {
+        let n = GetWindowTextLengthW(hwnd as HWND);
+        if n <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; n as usize + 1];
+        let got = GetWindowTextW(hwnd as HWND, buf.as_mut_ptr(), buf.len() as i32);
+        if got <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..got as usize])
+    }
+}
+
+/// 打开进程选择弹窗（模态：禁用父窗口，关闭时恢复）。
+/// 必须在 main 线程调用（与 `open()` 同源）。
+fn open_proc_picker() {
+    unsafe {
+        let parent = WIN.load(Ordering::Acquire);
+        if parent == 0 {
+            return;
+        }
+        // 已打开则前置，不重开第二个。
+        if let Some(p) = *PROC_PICK.lock().unwrap() {
+            if IsWindow(p as HWND) != 0 {
+                ShowWindow(p as HWND, SW_SHOW);
+                SetForegroundWindow(p as HWND);
+                return;
+            }
+        }
+        let instance = GetModuleHandleW(0 as PCWSTR);
+        let class = wstr("anydrag-win-procpick");
+        let cls = WNDCLASSEXW {
+            cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(proc_pick_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: instance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: LoadCursorW(instance, IDC_ARROW),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: 0 as PCWSTR,
+            lpszClassName: class.as_ptr(),
+            hIconSm: std::ptr::null_mut(),
+        };
+        if RegisterClassExW(&cls) == 0 && GetLastError() != 1410 {
+            eprintln!("anydrag-win: RegisterClassExW(procpick) failed");
+            return;
+        }
+        let dpi = GetDpiForSystem().max(96) as i32;
+        let sc = |v: i32| v * dpi / 96;
+        let hwnd = CreateWindowExW(
+            WS_EX_DLGMODALFRAME,
+            class.as_ptr(),
+            wstr("选择要无视手势的进程").as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            sc(560),
+            sc(440),
+            parent as HWND,
+            0 as _,
+            instance,
+            std::ptr::null_mut(),
+        );
+        if hwnd.is_null() {
+            eprintln!("anydrag-win: CreateWindowExW(procpick) failed");
+            return;
+        }
+        *PROC_PICK.lock().unwrap() = Some(hwnd as isize);
+        // 模态：禁用父窗口，避免用户在弹窗开着的期间改主界面造成状态错乱。
+        EnableWindow(parent as HWND, 0);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+/// 进程选择弹窗的窗口过程。
+unsafe extern "system" fn proc_pick_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let instance = GetModuleHandleW(0 as PCWSTR);
+            // ListBox 多选，占满客户区上部。
+            let list = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                wstr("LISTBOX").as_ptr(),
+                std::ptr::null_mut() as PCWSTR,
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_VSCROLL
+                    | LBS_MULTIPLESEL as u32
+                    | LBS_HASSTRINGS as u32
+                    | LBS_NOTIFY as u32,
+                12,
+                12,
+                516,
+                320,
+                hwnd,
+                ID_PROC_LIST as _,
+                instance,
+                std::ptr::null_mut(),
+            );
+            let dpi = GetDpiForSystem().max(96) as i32;
+            let sc = |v: i32| v * dpi / 96;
+            CreateWindowExW(
+                0,
+                wstr("BUTTON").as_ptr(),
+                wstr("确定").as_ptr(),
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON as u32,
+                sc(300),
+                sc(348),
+                sc(110),
+                sc(30),
+                hwnd,
+                ID_PROC_OK as _,
+                instance,
+                std::ptr::null_mut(),
+            );
+            CreateWindowExW(
+                0,
+                wstr("BUTTON").as_ptr(),
+                wstr("取消").as_ptr(),
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+                sc(420),
+                sc(348),
+                sc(110),
+                sc(30),
+                hwnd,
+                IDCANCEL as _,
+                instance,
+                std::ptr::null_mut(),
+            );
+            PROC_LIST.store(list as isize, Ordering::Release);
+            // 灌数据。已在名单里的 exe 默认选中。
+            let current = config::snapshot().native_excluded;
+            for (shown, exe) in visible_windows() {
+                let t = wstr(&shown);
+                let idx = SendMessageW(list, LB_ADDSTRING, 0, t.as_ptr() as isize);
+                if !exe.is_empty() && current.iter().any(|e| e == &exe) {
+                    SendMessageW(list, LB_SETSEL, 1, idx);
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = wp & 0xFFFF;
+            if id == ID_PROC_OK {
+                apply_proc_selection();
+                close_proc_picker(hwnd);
+            } else if id == IDCANCEL as usize {
+                close_proc_picker(hwnd);
+            }
+            0
+        }
+        WM_CLOSE => {
+            close_proc_picker(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// 把 ListBox 的选中项写回设置窗口的多行输入框（**不写盘**——用户还要点"保存"）。
+///
+/// 合并而非替换：弹窗里勾掉的项会从名单消失，但用户手填的、当前不可见的进程
+/// （例如没开着的游戏）必须保留。所以是"选中集合 ∪ 手填集合里不在可见集合中的项"。
+fn apply_proc_selection() {
+    let lb = PROC_LIST.load(Ordering::Acquire);
+    if lb == 0 {
+        return;
+    }
+    let c = *CTL.lock().unwrap();
+    // 整个函数体都在 unsafe 里：text_of/set_text 与 SendMessageW 都是 FFI。
+    unsafe {
+    // 手填部分：现有名单里，属于"当前不可见窗口"的条目要保留
+    //（例如没开着的游戏，用户提前手填好了）。
+    let mut keep: Vec<String> = parse_list(&text_of(c.excl));
+    let visible_exes: Vec<String> = visible_windows()
+        .into_iter()
+        .map(|(_, e)| e)
+        .filter(|e| !e.is_empty())
+        .collect();
+    keep.retain(|e| !visible_exes.iter().any(|v| v == e));
+
+    // 勾选部分：从 ListBox 的选中项里取 exe（显示文本形如 "标题  [exe]"）。
+    let mut picked: Vec<String> = Vec::new();
+    {
+        let count = SendMessageW(lb as HWND, LB_GETCOUNT, 0, 0);
+        for i in 0..count {
+            if SendMessageW(lb as HWND, LB_GETSEL, i as usize, 0) <= 0 {
+                continue;
+            }
+            let len = SendMessageW(lb as HWND, LB_GETTEXTLEN, i as usize, 0) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let got = SendMessageW(lb as HWND, LB_GETTEXT, i as usize, buf.as_mut_ptr() as isize);
+            if got == LB_ERR as isize {
+                continue;
+            }
+            let text = String::from_utf16_lossy(&buf[..got as usize]);
+            if let (Some(s), Some(e)) = (text.rfind('['), text.rfind(']')) {
+                if e > s {
+                    picked.push(text[s + 1..e].to_string());
+                }
+            }
+        }
+    }
+    let mut all = std::mem::take(&mut keep);
+    for e in &picked {
+        if !e.is_empty() && !all.contains(e) {
+            all.push(e.clone());
+        }
+    }
+    all.sort();
+    all.dedup();
+    set_text(c.excl, &all.join("\r\n"));
+    }
+}
+
+/// 关闭进程选择弹窗并恢复父窗口。
+fn close_proc_picker(hwnd: HWND) {
+    unsafe {
+        if let Some(parent) = PROC_PICK.lock().unwrap().take() {
+            if IsWindow(parent as HWND) != 0 {
+                EnableWindow(parent as HWND, 1);
+            }
+        }
+        PROC_LIST.store(0, Ordering::Release);
+        DestroyWindow(hwnd);
+    }
+}
 /// 把当前生效配置灌进控件（打开窗口时调用）。
 unsafe fn populate(_hwnd: HWND) {
     let cfg = config::snapshot();
