@@ -223,6 +223,20 @@ cmd /c "build.bat"         # release 构建（含 rc.exe 图标/manifest 内嵌�
     **同款假 FAIL 也会被自己的测试脚本造出来**：用 Python 先写 `SW_SHOWNORMAL` 再
     `SetWindowPos` 就会留下不一致态。正确清态顺序：
     `SW_RESTORE` -> `SW_SHOWNORMAL` -> `SetWindowPos`。
+15. **`CreateWindowExW` 同步触发 `WM_CREATE`（2026-10-21 进程选择弹窗踩到）**：
+    在 `WM_CREATE` 里想把子控件句柄存进一个 `Option<(父, 子)>` 静态，但外层那句
+    `*STATIC.lock() = Some((hwnd, 0))` 在 `CreateWindowExW` **之后**才执行
+    ⇒ `WM_CREATE` 时静态还是 `None` ⇒ 子句柄永远写不进去 ⇒ 后续用它时拿到 0，
+    **功能静默失效且毫无报错**。修法：拆成两个静态，`WM_CREATE` 只写属于自己那个，
+    不依赖外层赋值顺序。
+16. **跨进程读控件内容会被 UIPI 过滤（2026-10-21）**：外部进程用
+    `GetWindowTextLengthW` / `GetWindowTextW` 读另一个进程的 Edit 控件，
+    **恒返回空**，而目标进程内部用同样的 API 却能读到值。验证跨进程 UI 状态必须用
+    `SendMessageTimeoutW(hwnd, WM_GETTEXT, …)`（`WM_GETTEXTLENGTH` 同样被过滤）。
+    曾因此误判"`set_text` 没生效"，白查好几轮。
+17. **ListBox 消息号与返回值语义**：`LB_SETSEL`=0x185（wParam=BOOL，lParam=index）、
+    `LB_GETSEL`=0x187（wParam=index）。`LB_SETSEL` **成功时返回 0**，
+    别把 0 当失败；`LB_GETSEL` 失败返回 `LB_ERR`(-1)，判断选中要用 `> 0`。
 
 ---
 
