@@ -1,0 +1,47 @@
+[tray] NIM_ADD ok, hIcon=0xa460829
+[heartbeat] 1s: app=1 timer=0 other=0 pending=false armed=false mods=2 dropped=0 state=Idle
+[engine] Move { x: 1725, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[resolve] (1725,230) 0x103d8 skip: tool window
+[resolve] (1725,230) 0x2608f0 skip: not visible
+[resolve] (1725,230) 0x16403a6 hit exe=notepad.exe frame=[1057, 150, 2393, 1193]
+[engine] Down { x: 1725, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[engine] Move { x: 1745, y: 230, mods: 262144 } → [BeginNativeDrag, End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1765, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1785, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1805, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Up { x: 1805, y: 230, mods: 262144 } → [End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[heartbeat] 1s: app=7 timer=0 other=0 pending=false armed=false mods=2 dropped=0 state=Idle
+[engine] Move { x: 1785, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[resolve] (1785,230) 0x103d8 skip: tool window
+[resolve] (1785,230) 0x2608f0 skip: not visible
+[resolve] (1785,230) 0x230b28 skip: tool window
+[resolve] (1785,230) 0x16403a6 hit exe=notepad.exe frame=[1097, 150, 2433, 1193]
+[engine] Down { x: 1785, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[engine] Move { x: 1805, y: 230, mods: 262144 } → [BeginNativeDrag, End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1825, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1845, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1865, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Up { x: 1865, y: 230, mods: 262144 } → [End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[heartbeat] 1s: app=7 timer=0 other=0 pending=false armed=false mods=2 dropped=0 state=Idle
+[engine] Move { x: 1845, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[resolve] (1845,230) 0x103d8 skip: tool window
+[resolve] (1845,230) 0x2608f0 skip: not visible
+[resolve] (1845,230) 0x16403a6 hit exe=notepad.exe frame=[1177, 150, 2513, 1193]
+[engine] Down { x: 1845, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[engine] Move { x: 1865, y: 230, mods: 262144 } → [BeginNativeDrag, End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1885, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1905, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1925, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Up { x: 1925, y: 230, mods: 262144 } → [End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[heartbeat] 1s: app=7 timer=0 other=0 pending=false armed=false mods=2 dropped=0 state=Idle
+[engine] Move { x: 1905, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[resolve] (1905,230) 0x103d8 skip: tool window
+[resolve] (1905,230) 0x2608f0 skip: not visible
+[resolve] (1905,230) 0x400968 skip: tool window
+[resolve] (1905,230) 0x16403a6 hit exe=notepad.exe frame=[1217, 150, 2553, 1193]
+[engine] Down { x: 1905, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[engine] Move { x: 1925, y: 230, mods: 262144 } → [BeginNativeDrag, End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1945, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1965, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1985, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Up { x: 1985, y: 230, mods: 262144 } → [End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)

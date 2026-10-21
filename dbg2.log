@@ -1,0 +1,12 @@
+[tray] NIM_ADD ok, hIcon=0x1060cc1
+[heartbeat] 1s: app=1 timer=0 other=0 pending=false armed=false mods=2 dropped=0 state=Idle
+[engine] Move { x: 1205, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[resolve] (1205,230) 0x103d8 skip: tool window
+[resolve] (1205,230) 0x2608f0 skip: not visible
+[resolve] (1205,230) 0x16403a6 hit exe=notepad.exe frame=[537, 150, 1873, 1193]
+[engine] Down { x: 1205, y: 230, mods: 262144 } → [None] (pre_hwnd=None, exe-target=)
+[engine] Move { x: 1225, y: 230, mods: 262144 } → [BeginNativeDrag, End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1245, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1265, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Move { x: 1285, y: 230, mods: 262144 } → [None] (pre_hwnd=Some(23331750), exe-target=notepad.exe)
+[engine] Up { x: 1285, y: 230, mods: 262144 } → [End] (pre_hwnd=Some(23331750), exe-target=notepad.exe)

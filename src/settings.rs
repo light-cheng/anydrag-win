@@ -495,7 +495,14 @@ unsafe fn create_controls(parent: HWND) {
     *CTL.lock().unwrap() = c;
 
     // 下拉框内容（COMBOBOX 的字符串必须在控件建好后加）。
-    let items = ["fallback（SetWindowPos，兼容性最好）", "native（原生拖动循环，更顺滑）"];
+    // 文案必须如实反映实测结论（docs/spike-scandrag.md）：native 走
+    // PostMessage(SC_DRAGMOVE)，让目标应用自己跑 caption 拖动循环——**在 notepad 等
+    // 应用上直接失效**（spike 实测 dx=0），只有 explorer 这类有效。旧文案写"更顺滑"
+    // 会诱导用户选中它，然后"Alt 完全拖不动"（2026-10-21 用户报障即此）。
+    let items = [
+        "fallback（SetWindowPos，兼容性最好，推荐）",
+        "native（原生拖动循环；仅部分应用有效，可能完全拖不动）",
+    ];
     for it in items.iter() {
         let t = wstr(it);
         SendMessageW(c.strategy as HWND, CB_ADDSTRING, 0, t.as_ptr() as isize);

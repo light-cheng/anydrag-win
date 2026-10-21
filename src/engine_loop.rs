@@ -429,6 +429,16 @@ fn step(state: &mut DragState, ev: &EngineEvent, cfg: &Config) -> (Option<Geom>,
             Action::BeginNativeDrag => {
                 if let Some(h) = pre_hwnd {
                     winmod::post_sys_command(h, winmod::SC_DRAGMOVE);
+                    // **失效告警（2026-10-21 用户报障："Alt 完全拖不动"）**：
+                    // native 走 PostMessage(SC_DRAGMOVE)，让目标应用自己跑 caption
+                    // 拖动循环。spike 实测它在 notepad 等应用上**直接无效**（dx=0），
+                    // 只有 explorer 之类有效——且失败时**毫无报错**，用户只看到"拖不动"。
+                    // 这里在下发后打一条一次性提示（仅 debug），把"静默失效"变成可诊断。
+                    if std::env::var_os("ANYDRAG_DEBUG").is_some() {
+                        eprintln!(
+                            "[native] 已发 SC_DRAGMOVE 给 0x{h:x}；若窗口不跟随，说明该应用                             不支持 native 通道（spike 实测 notepad 即如此）——                             请把 default_strategy 改为 fallback，或把该 exe 加入 fallback_apps"
+                        );
+                    }
                 }
                 gesture_done = true;
             }
