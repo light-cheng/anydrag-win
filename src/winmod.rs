@@ -30,9 +30,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowLongW, GetWindowPlacement, GetWindowRect,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW,
-    SetWindowPlacement, SetWindowPos, GWL_EXSTYLE, SMTO_NORMAL, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SW_MAXIMIZE, SW_RESTORE, WM_SYSCOMMAND,
-    WINDOWPLACEMENT, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    SetWindowPlacement, SetWindowPos, ShowWindow, GWL_EXSTYLE, SMTO_NORMAL,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SW_MAXIMIZE, SW_RESTORE,
+    WM_SYSCOMMAND, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 // ---- 未文档化但数十年稳定的 syscommand 常量（GOAL §3：0xF012 由 T2.3 spike 背书）----
@@ -272,27 +272,47 @@ pub fn post_sys_command(hwnd: isize, cmd: u32) {
 /// 应用进入菜单模式时，它的消息泵处在模态状态，投递的 WM_SYSCOMMAND 会被吞掉或无限
 /// 期延后——这正是 2026-10-16 用户实测的"Alt 双击根本无法最大化、只弹出菜单栏快捷键
 /// 提示"。`SetWindowPlacement` 由窗口管理器直接处理，与应用的泵状态无关。
-/// `WPF_ASYNCWINDOWPLACEMENT` 让调用立即返回，不阻塞 engine 线程。
+///
+/// **不能用 `WPF_ASYNCWINDOWPLACEMENT`（2026-10-21 实测）**：异步标志下
+/// `SetWindowPlacement` 只把 `showCmd` 写进窗口记录就返回，**窗口矩形可能完全不变**
+/// —— 实测 notepad 连点两次 Alt 双击，`showCmd` 已是 3（"已最大化"）而 DWM 帧
+/// 仍是普通尺寸，于是 `ALT_DBL=FAIL (maximized=false)`，且此后每次最大化都因
+/// "已经是最大化态"而幂等地什么都不做。同步调用则立刻重排（实测 rect 变
+/// `(-7,-7,1928,1176)`）。这里不是热路径（一次手势一次调用），同步的代价可忽略，
+/// 换来确定性。
 pub fn set_placement_max_restore(hwnd: isize, maximize: bool) {
     let hwnd_ptr: HWND = hwnd as *mut c_void;
     unsafe {
         if IsWindow(hwnd_ptr) == 0 {
             return;
         }
+        // WINDOWPLACEMENT.showCmd 是 u32，而 SW_* 常量在 windows-sys 里是 i32。
+        let cmd: u32 = if maximize {
+            SW_MAXIMIZE
+        } else {
+            SW_RESTORE
+        } as u32;
+        // 先读一次拿全字段：只改 showCmd 会让 rcNormalPosition 等保持原值，
+        // 这正是"还原回原来大小"所需要的（别写成全零，否则还原后窗口会归位到 0,0）。
         let mut wndpl: WINDOWPLACEMENT = std::mem::zeroed();
         wndpl.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
         if GetWindowPlacement(hwnd_ptr, &mut wndpl) == 0 {
             return;
         }
-        // WINDOWPLACEMENT.showCmd 是 u32，而 SW_* 常量在 windows-sys 里是 i32。
-        let cmd: u32 = if maximize {
-            SW_MAXIMIZE as u32
-        } else {
-            SW_RESTORE as u32
-        };
         wndpl.showCmd = cmd;
-        wndpl.flags |= WPF_ASYNCWINDOWPLACEMENT;
-        SetWindowPlacement(hwnd_ptr, &wndpl);
+        // 同步下发（不置 WPF_ASYNCWINDOWPLACEMENT，见上方注释）。
+        if SetWindowPlacement(hwnd_ptr, &wndpl) == 0 {
+            return;
+        }
+        // **兜底校验**：少数窗口（实测 notepad 在"记录态已是最大化但矩形未重排"的
+        // 不一致态下）会吞掉这次调用。此时退回 ShowWindow 的同步语义——它同样不经过
+        // 目标应用的消息泵。只在确实没生效时才补，正常路径零额外开销。
+        let mut after: WINDOWPLACEMENT = std::mem::zeroed();
+        after.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        let landed = GetWindowPlacement(hwnd_ptr, &mut after) != 0 && after.showCmd == cmd;
+        if !landed {
+            ShowWindow(hwnd_ptr, cmd as i32);
+        }
     }
 }
 

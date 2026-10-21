@@ -69,6 +69,46 @@ pub fn mods_len() -> usize {
         .len()
 }
 
+/// 钩子当前监视的 VK 列表与给定列表是否**内容一致**——不是只比长度。
+///
+/// **为什么不能只比长度（2026-10-21）**：引擎的自愈校验旧版写的是
+/// `hook::mods_len() != live.all_vks().len()`。把触发键从 Alt 改成 Ctrl 这种
+/// “个数不变”的修改，长度相等 → 校验通过 → 钩子继续按**旧**键表算 mods
+/// → 用户改完触发键后的第一次手势静默失效（表现为“改了没反应”）。
+/// 锁污染同样就地拆锁读。
+pub fn mods_match(vks: &[u16]) -> bool {
+    let cur = MODS_VKS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 集合语义：长度相等且互为子集。钩子回调是逐个 VK 查 GetAsyncKeyState，
+    // 顺序本无意义；`all_vks()` 的顺序固定，但集合比较让“顺序不同”不会误判
+    // 成“配置变了”而触发无谓的 set_mods。
+    cur.len() == vks.len() && vks.iter().all(|v| cur.contains(v))
+}
+
+/// 唤醒 engine 线程：投递一条**空** `WM_APP`（ring 里没有对应事件）。
+///
+/// **为什么需要（2026-10-21）**：引擎的重载检查原本只在 `WM_APP` 分支里跑，
+/// 而 `WM_APP` 只由钩子在鼠标事件发生时投递。于是：
+///
+/// - 设置界面点“保存”→ `config::replace()` 换掉内存值 → 引擎若正阻塞在
+///   `GetMessageW`（用户没动鼠标），**根本不醒来**，新配置要等下一次鼠标事件
+///   才生效；
+/// - 更糟的是钩子的 `MODS_VKS` 也在同一分支里刷新，所以改触发键后**注入的
+///   第一批事件仍按旧键表算 mods**（`GetAsyncKeyState` 在钩子线程、早于引擎
+///   重载），第一次手势必失效。
+///
+/// 保存时显式发一条空信号把引擎叫醒，它跑完重载发现 ring 是空的就直接返回
+/// （`drain` 得 0，无副作用）。tid 为 0（钩子未装）时静默跳过。
+pub fn wake_engine() {
+    let tid = ENGINE_TID.load(Ordering::Relaxed);
+    if tid != 0 {
+        unsafe {
+            PostThreadMessageW(tid, WM_APP, 0, 0);
+        }
+    }
+}
+
 /// LL 钩子是否仍安装在位（callback 卡顿超 300ms 系统会自动移除，
 /// 故这是"无卡顿"的量化哨兵；T3.1 冒烟与 T4.2 验收用）。
 pub fn is_installed() -> bool {
@@ -157,7 +197,7 @@ unsafe extern "system" fn ll_proc(nCode: i32, wParam: usize, lParam: isize) -> i
             };
             RING.push(ev);
             // 唤醒 engine 线程（固定信号，非阻塞）。
-            PostThreadMessageW(ENGINE_TID.load(Ordering::Relaxed), WM_APP, 0, 0);
+            wake_engine();
         }
     }
     // 无条件放行（无论是否命中）：低级钩子链绝不能被截断。
@@ -167,4 +207,49 @@ unsafe extern "system" fn ll_proc(nCode: i32, wParam: usize, lParam: isize) -> i
         wParam,
         lParam,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归（2026-10-21）：自愈校验必须**内容级**比较。
+    /// 旧版只比 `mods_len()`，于是把触发键从 Alt 改成 Ctrl（个数不变）时判定
+    /// “没变” → 钩子继续按旧键表算 mods → 用户改完触发键的第一次手势静默失效。
+    ///
+    /// **必须把 set_mods 的用例合并在一个 `#[test]` 里**：`MODS_VKS` 是进程级
+    /// 全局，多个测试并发写会互相踩（实测踩过：顺序断言被另一个测试改掉值）。
+    #[test]
+    fn mods_match_compares_content_not_length() {
+        set_mods(&[0x12]); // Alt
+        assert!(mods_match(&[0x12]), "identical list must match");
+        // 同长度、不同键 —— 旧的长度比较会误判为“没变”，这正是要钉住的缺陷。
+        assert!(
+            !mods_match(&[0x11]),
+            "same length but different VK must NOT match (Alt→Ctrl)"
+        );
+        // 多一个键、少一个键都要判不同。
+        assert!(!mods_match(&[0x12, 0x11]), "superset must not match");
+        assert!(!mods_match(&[]), "empty list must not match a non-empty one");
+        // 集合语义：同键不同序算匹配（钩子逐个 VK 查键，顺序无意义）。
+        set_mods(&[0x11, 0x12]);
+        assert!(mods_match(&[0x12, 0x11]), "same keys in any order must match");
+        assert!(!mods_match(&[0x12, 0x10]), "different key must not match");
+
+        // 空列表是“关闭手势”的合法配置，不是异常。
+        set_mods(&[]);
+        assert_eq!(mods_len(), 0);
+        assert!(mods_match(&[]));
+
+        set_mods(&[0x11, 0x12, 0x10]);
+        assert_eq!(mods_len(), 3);
+    }
+
+    /// `wake_engine` 在钩子未装（tid=0）时必须静默返回——settings/tray 在
+    /// 单元测试进程里也会调它，绝不能 panic。
+    #[test]
+    fn wake_engine_without_hook_is_noop() {
+        ENGINE_TID.store(0, Ordering::Release);
+        wake_engine(); // 不装钩子的进程：直接返回
+    }
 }

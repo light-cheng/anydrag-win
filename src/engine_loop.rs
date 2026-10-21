@@ -214,13 +214,25 @@ pub fn run(cfg: Arc<Config>) {
                 unsafe { KillTimer(std::ptr::null_mut(), id) };
             }
         }
-        if msg.message == WM_APP {
-            idle_since = std::time::Instant::now();
-            // 自愈校验：钩子监视列表与生效配置必须一致（长度不等 = 被谁清空/污染了，
-            // 立即重发）。2026-10-20 事故：运行中监视列表归零 → 修饰键恒不命中 →
-            // "所有手势全灭但进程毫无异常"。每事件一次的代价是两次无竞争读锁。
+        // ── 配置热重载 + 钩子监视表自愈（**每条消息**都检查，不限 WM_APP）──
+        //
+        // **为什么必须放在 `WM_APP` 分支外（2026-10-21）**：这两件事原先只在
+        // `WM_APP` 里做，而 `WM_APP` 只由钩子在**鼠标事件发生时**投递。于是：
+        //   设置界面点“保存” → `config::replace()` 换掉内存值 → 引擎正阻塞在
+        //   `GetMessageW`（用户没动鼠标）→ 它**根本不醒来**，新配置要等下一次
+        //   鼠标事件才生效。
+        // 更要紧的是钩子的 `MODS_VKS` 也在这里刷新：改触发键（Alt→Ctrl）后，
+        // 钩子线程的 `GetAsyncKeyState` 是**按旧键表**算 mods 的，注入的第一批
+        // 事件就已经错了 —— 用户会觉得“改了没反应”。现在 hook::wake_engine()
+        // 会在保存时补发一条空 WM_APP 把它叫醒，这条空消息正好走这里。
+        //
+        // 自愈校验用**内容级**比较（`mods_match`，不是只比长度）：Alt→Ctrl
+        // 这类“个数不变”的修改，旧的长度比较会判定“没变”从而永不刷新。
+        // 2026-10-20 事故：运行中监视列表归零 → 修饰键恒不命中 → “所有手势全灭
+        // 但进程毫无异常”。每消息一次的代价是两次无竞争读锁。
+        {
             let want = live.all_vks();
-            if hook::mods_len() != want.len() {
+            if !hook::mods_match(&want) {
                 hook::set_mods(&want);
             }
             // 热重载检查，两条来源都要看：
@@ -241,6 +253,9 @@ pub fn run(cfg: Arc<Config>) {
                     );
                 }
             }
+        }
+        if msg.message == WM_APP {
+            idle_since = std::time::Instant::now();
             // hook 每事件 Post 一条 WM_APP；一次 drain 吃干净（可能攒了多条）。
             let mut buf: [core::mem::MaybeUninit<EngineEvent>; hook::RING_SLOTS] =
                 unsafe { core::mem::zeroed() };

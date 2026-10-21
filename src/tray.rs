@@ -248,6 +248,8 @@ fn toggle_enabled() -> bool {
     let mut c = config::load();
     c.enabled = new;
     c.save();
+    // 唤醒引擎让它立即按新开关跑（它可能正阻塞在 GetMessageW，见 hook::wake_engine）。
+    crate::hook::wake_engine();
     new
 }
 

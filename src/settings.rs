@@ -330,6 +330,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     // 热重载：engine 线程下一个事件批次就会用新值；同时写盘持久化。
                     config::replace(cfg.clone());
                     cfg.save();
+                    // **必须显式唤醒引擎（2026-10-21）**：引擎的重载检查由消息驱动，
+                    // 而它此刻很可能正阻塞在 `GetMessageW`（用户点完保存并没动鼠标）。
+                    // 不补这一条，新配置要等下一次鼠标事件才生效；若改的是触发键，
+                    // 钩子仍按旧键表算 mods，**第一次手势必失效**。
+                    crate::hook::wake_engine();
                     DestroyWindow(hwnd);
                 }
                 ID_CANCEL => {
