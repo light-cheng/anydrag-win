@@ -66,7 +66,7 @@ target\release\anydrag-win.exe
 ## 配置
 
 文件：`%APPDATA%\anydrag-win\config.json`（托盘"配置文件…"可直达）。
-**改完重启 anydrag-win 生效**（唯一例外：托盘"启用/禁用"即时生效并写盘）。
+**改完立即生效，无需重启**（设置界面保存 / 直接手改文件都走热重载，见下文）。
 文件缺失或 JSON 损坏 → 按默认值运行，不报错。
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -100,12 +100,18 @@ target\release\anydrag-win.exe
 
 改 `config.json` 有两条路径，**都不需要重启程序**：
 
-1. **设置界面点"保存"** —— 走 `config::replace()`，版本号自增，引擎下一批事件即刷新。
+1. **设置界面点"保存"** —— 走 `config::replace()`，版本号自增；保存动作还会显式
+   向引擎线程投递一条空 `WM_APP` 把它从 `GetMessageW` 的阻塞中叫醒，所以**不用
+   先动一下鼠标**才生效。
 2. **直接手改文件** —— 引擎每批事件比对文件 mtime，变了就重新载入（2026-10-21 加入）。
    修复前手改**完全无效**：引擎只认版本号，会一直用启动时的内存快照，
    表现为"我明明改好了，怎么还是不对"，只有重启进程才生效。
 
    `ANYDRAG_DEBUG=1` 下会打印 `[config] 已重载（file_changed=true）strategy=...` 便于确认。
+
+**改触发键要注意**：引擎靠"钩子监视列表与配置一致"自愈，且比较是**内容级**的
+（`hook::mods_match`）。把 Alt 换成 Ctrl 这种"个数不变"的改动同样会刷新钩子键表
+——修复前只比长度，会误判成"没变"，导致改完第一次手势静默失效。
 
 ## 已知边界（MVP 范围）
 
@@ -119,13 +125,14 @@ target\release\anydrag-win.exe
 - **Win11 打包应用**（notepad 等）：其宿主辅助窗会劫持命中测试，本工具已用
   Z 序候选扫描规避（实测不移动、不点错窗）；`native` 通道对这类应用不可用，
   默认 fallback 即为此定（见 `docs/spike-scandrag.md`）。
-- 配置中除"启用/禁用"外**改后需重启**才生效（MVP 不做热加载）。
+- 配置**已全量支持热重载**：设置界面保存与直接手改文件都即时生效，无需重启
+  （2026-10-21 补齐手改路径；此前只有设置界面保存会生效）。
 - 只有一份实例：多开只会装多条钩子、无收益。
 
 ## 开发
 
 ```bash
-cargo test            # 53 个单测（纯逻辑模块 ring/mods/engine/config/icon/coalesce/throttle 零 windows-sys）
+cargo test            # 56 个单测（纯逻辑模块 ring/mods/engine/config/icon/coalesce/throttle 零 windows-sys）
 cmd /c "build.bat"     # release 构建
 ```
 

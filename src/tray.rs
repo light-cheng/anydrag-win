@@ -191,7 +191,7 @@ unsafe extern "system" fn wnd_proc(
                          · 朝某个方向拖拽后松开 → 窗口吸附到该方向的半屏 / 四分之一屏\n\n\
                          更详细的选项（触发键、阈值、排除名单、中键分屏开关）见托盘菜单「设置…」。\n\
                          配置文件：{p}\n\
-                         修改后重启 anydrag-win 生效（「启用/禁用」与「设置…」即时生效）。",
+                         修改后立即生效，无需重启（「设置…」保存或直接手改该文件均可）。",
                     ));
                     let cap = wstr("anydrag-win");
                     MessageBoxW(hwnd, text.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
