@@ -13,6 +13,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    # 设置界面的深色主题：SetWindowTheme 在 UI_Controls（SPEC R9）。
+    "Win32_UI_Controls",
+    # 读 AppsUseLightTheme 判深浅主题：RegGetValueW 在 System_Registry。
+    "Win32_System_Registry",
+    # GetUserDefaultUILanguage：首次运行按系统语言选中文/英文（SPEC §4.3）。
+    "Win32_Globalization",
+    # 高对比度检测（HIGHCONTRASTW / SPI_GETHIGHCONTRAST）：自绘控件要能退回原生。
+    "Win32_UI_Accessibility",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_System_LibraryLoader",

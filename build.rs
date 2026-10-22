@@ -53,7 +53,8 @@ fn embed_resources(manifest_dir: &PathBuf) {
     if let Ok(kits) = std::env::var("WindowsSdkDir") {
         candidates.push(PathBuf::from(kits).join("bin").join("x64").join("rc.exe"));
     }
-    let sdk_bin = PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10\\bin");
+    let sdk_root = PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10");
+    let sdk_bin = sdk_root.join("bin");
     if let Ok(rd) = std::fs::read_dir(&sdk_bin) {
         let mut versions: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         versions.sort();
@@ -63,16 +64,46 @@ fn embed_resources(manifest_dir: &PathBuf) {
         }
     }
 
+    // **include 路径必须自己找，不能指望 INCLUDE 环境变量**（2026-10-23 实测）：
+    // `app.rc` 里有 `#include <winres.h>`，而 rc.exe 只按 INCLUDE 找头文件。
+    // INCLUDE 是 `vcvarsall.bat` 设的 —— 从 `build.bat` 构建时它在，但直接跑
+    // `cargo build`（IDE、CI、本仓库的日常验证）时**不在**，于是 rc.exe 报
+    // `RC1015: cannot open include file 'winres.h'`，build.rs 只打一条 warning
+    // 就跳过 —— 结果是 exe 里**既没有图标也没有 manifest**，而构建"成功"。
+    //
+    // 那个 manifest 不是装饰：它声明 `PerMonitorV2` DPI 感知。缺了它进程虽然
+    // 调了 `SetProcessDpiAwarenessContext`，但清单级声明缺失时系统按 96 DPI
+    // 虚拟化窗口尺寸 —— 表现为 150% 缩放下设置窗口只有 575x771（而不是
+    // 840x1101），右半边与下半边被裁掉。**静默降级，没有任何报错**（坑 #21 同款）。
+    let mut includes: Vec<PathBuf> = Vec::new();
+    if let Ok(inc) = std::env::var("INCLUDE") {
+        includes.extend(std::env::split_paths(&inc));
+    }
+    // 扫 SDK 的 include/<ver>/{um,shared}（winres.h 在 um 下）。
+    if let Ok(rd) = std::fs::read_dir(sdk_root.join("include")) {
+        let mut versions: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        versions.sort();
+        versions.reverse();
+        for v in versions {
+            includes.push(v.join("um"));
+            includes.push(v.join("shared"));
+        }
+    }
+
     let mut ok = false;
     for rc in &candidates {
         // /nologo 静默；/fo 指定输出；cwd 设成 assets（.rc 里用的是相对 ico 名）。
-        let status = std::process::Command::new(rc)
-            .current_dir(manifest_dir.join("assets"))
+        let mut cmd = std::process::Command::new(rc);
+        cmd.current_dir(manifest_dir.join("assets"))
             .arg("/nologo")
             .arg("/fo")
-            .arg(&res)
-            .arg(&rc_src)
-            .status();
+            .arg(&res);
+        for inc in &includes {
+            if inc.is_dir() {
+                cmd.arg(format!("/i{}", inc.display()));
+            }
+        }
+        let status = cmd.arg(&rc_src).status();
         if let Ok(st) = status {
             if st.success() {
                 ok = true;

@@ -8,12 +8,12 @@
 //! 文案散落在 `settings.rs` / `tray.rs` 里各写一遍中文，是坑 #18 的同款形态：
 //! 同一语义两处实现，改语言时必然漏掉一处，而漏掉的那处**不会报错**，
 //! 只会让界面中英混杂。所以全部文案收在 `Key` 枚举里，`tr()` 是唯一出口；
-//! 单测 `every_key_translated` 用穷举 match 钉住"新增 Key 必须两种语言都给译文"。
+//! `tr()` 用**穷举 match**，新增 `Key` 而漏写任一语言 = 编译失败（比运行时断言强）。
 //!
 //! ## 为什么不引 i18n crate
 //!
 //! 两种语言、约 30 条文案。引 crate 要处理资源文件打包、语言协商、复数规则，
-//! 而本工具没有复数、没有占位符替换需求。手写表反而更小、更可测。
+//! 而本工具没有复数需求。手写表反而更小、更可测。
 
 /// 界面语言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,10 @@ impl Lang {
     }
 
     /// 另一个语言（语言切换按钮用）。
+    ///
+    /// 界面用的是两个独立的分段按钮（点哪个直接选哪个，不是"切到另一个"），
+    /// 所以生产路径不调它；保留是因为单测用它钉住"两种语言互为反面"这个性质。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn toggle(self) -> Lang {
         match self {
             Lang::Zh => Lang::En,
@@ -59,28 +63,45 @@ impl Lang {
 }
 
 /// 全部界面文案的键。**新增键必须同时补两种语言**，否则 `tr` 的穷举 match 编译失败。
+///
+/// 分组与 SPEC §3.1 的信息架构一一对应（拖动/双击、缩放、手势参数、排除进程），
+/// 改布局时照着这里的分组走，别让键名停留在旧版"3 张卡片"的形态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
-    // ── 设置窗口 ─────────────────────────────
+    // ── 标题区 ───────────────────────────────
     WinTitle,
     Subtitle,
-    CardTrigger,
+    /// 语言分段按钮的两个标签。**这两种语言下文案相同**（语言名永远用自身语言写，
+    /// 否则英文界面里出现"中文"、中文界面里出现"Chinese" 反而看不懂）。
+    LangZh,
+    LangEn,
+    // ── 卡片标题 ─────────────────────────────
+    CardDrag,
+    CardResize,
     CardParams,
     CardExcluded,
-    LblDrag,
-    LblResize,
-    LblThreshold,
+    /// 卡 4 的灰色说明行（取代旧版游离在卡片外的"完全无视手势的进程："）。
+    CardExcludedDesc,
+    // ── 行标签 ───────────────────────────────
+    LblTriggerKeys,
+    LblDragThreshold,
     LblDoubleClick,
     LblMiddleSnap,
     LblMiddleThreshold,
+    ChkEnable,
+    // ── 单位后缀（自绘，跟在输入框后）────────
+    UnitPx,
+    /// 双击间隔的单位后缀；`{}` 不参与，纯静态。
+    UnitMsSystem,
+    // ── 按钮 / 提示 ──────────────────────────
     BtnPickProcs,
     BtnSave,
     BtnCancel,
-    ChkEnable,
+    BtnOk,
     HintImmediate,
     // ── 进程选择弹窗 ─────────────────────────
     ProcPickerTitle,
-    BtnOk,
+    ProcNoTitle,
     // ── 托盘 ────────────────────────────────
     TrayTipDisabled,
     MenuEnable,
@@ -89,7 +110,9 @@ pub enum Key {
     MenuUsage,
     MenuConfig,
     MenuQuit,
+    /// 用法弹窗正文。含**恰好一个 `{}`**，由调用方填入配置文件路径。
     UsageBody,
+    ConfigOpenFailed,
 }
 
 /// 取文案。唯一的文案出口。
@@ -100,26 +123,37 @@ pub fn tr(lang: Lang, key: Key) -> &'static str {
     }
 }
 
+/// 两个语言下**允许**完全相同的键：语言名用自身语言书写是通用做法
+/// （Windows 的语言列表、浏览器的语言选择器都这样），不是漏翻译。
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SAME_IN_BOTH_LANGS: &[Key] = &[Key::LangZh, Key::LangEn];
+
 fn zh(key: Key) -> &'static str {
     match key {
         Key::WinTitle => "anydrag-win 设置",
         Key::Subtitle => "按住 Alt 拖动任意窗口 · 托盘工具",
-        Key::CardTrigger => "触发键",
+        Key::LangZh => "中文",
+        Key::LangEn => "English",
+        Key::CardDrag => "拖动 / 双击",
+        Key::CardResize => "缩放",
         Key::CardParams => "手势参数",
-        Key::CardExcluded => "排除进程（一行一个，小写）",
-        Key::LblDrag => "拖动 / 双击：",
-        Key::LblResize => "缩放：",
-        Key::LblThreshold => "拖动阈值（像素）",
-        Key::LblDoubleClick => "双击间隔（毫秒，留空 = 跟随系统）",
+        Key::CardExcluded => "排除进程",
+        Key::CardExcludedDesc => "这些进程完全无视手势，一行一个，小写。",
+        Key::LblTriggerKeys => "触发键",
+        Key::LblDragThreshold => "拖动阈值",
+        Key::LblDoubleClick => "双击间隔",
         Key::LblMiddleSnap => "中键方向分屏",
-        Key::LblMiddleThreshold => "判定阈值（像素）",
+        Key::LblMiddleThreshold => "判定阈值",
+        Key::ChkEnable => "启用",
+        Key::UnitPx => "像素",
+        Key::UnitMsSystem => "毫秒（留空 = 跟随系统）",
         Key::BtnPickProcs => "选择进程…",
         Key::BtnSave => "保存",
         Key::BtnCancel => "取消",
-        Key::ChkEnable => "启用",
+        Key::BtnOk => "确定",
         Key::HintImmediate => "保存后立即生效，无需重启。",
         Key::ProcPickerTitle => "选择要无视手势的进程",
-        Key::BtnOk => "确定",
+        Key::ProcNoTitle => "（无标题）",
         Key::TrayTipDisabled => "anydrag-win（已禁用）",
         Key::MenuEnable => "启用",
         Key::MenuDisable => "禁用",
@@ -137,8 +171,10 @@ fn zh(key: Key) -> &'static str {
              按住鼠标中键：\n\
              · 朝某个方向拖拽后松开 → 窗口吸附到该方向的半屏 / 四分之一屏\n\n\
              更详细的选项（触发键、阈值、排除名单、中键分屏开关、界面语言）见托盘菜单「设置…」。\n\
-             修改后立即生效，无需重启（「设置…」保存或直接手改配置文件均可）。"
+             配置文件：{}\n\
+             修改后立即生效，无需重启（「设置…」保存或直接手改该文件均可）。"
         }
+        Key::ConfigOpenFailed => "无法自动打开配置文件，请手动打开：",
     }
 }
 
@@ -146,22 +182,30 @@ fn en(key: Key) -> &'static str {
     match key {
         Key::WinTitle => "anydrag-win Settings",
         Key::Subtitle => "Hold Alt and drag any window · Tray utility",
-        Key::CardTrigger => "Trigger keys",
+        Key::LangZh => "中文",
+        Key::LangEn => "English",
+        Key::CardDrag => "Drag / double-click",
+        Key::CardResize => "Resize",
         Key::CardParams => "Gesture parameters",
-        Key::CardExcluded => "Excluded processes (one per line, lowercase)",
-        Key::LblDrag => "Drag / double-click:",
-        Key::LblResize => "Resize:",
-        Key::LblThreshold => "Drag threshold (px)",
-        Key::LblDoubleClick => "Double-click window (ms, blank = system)",
+        Key::CardExcluded => "Excluded processes",
+        Key::CardExcludedDesc => {
+            "These processes ignore all gestures. One per line, lowercase."
+        }
+        Key::LblTriggerKeys => "Trigger keys",
+        Key::LblDragThreshold => "Drag threshold",
+        Key::LblDoubleClick => "Double-click window",
         Key::LblMiddleSnap => "Middle-drag snap",
-        Key::LblMiddleThreshold => "Threshold (px)",
-        Key::BtnPickProcs => "Select processes…",
+        Key::LblMiddleThreshold => "Snap threshold",
+        Key::ChkEnable => "Enabled",
+        Key::UnitPx => "px",
+        Key::UnitMsSystem => "ms (blank = system)",
+        Key::BtnPickProcs => "Pick processes…",
         Key::BtnSave => "Save",
         Key::BtnCancel => "Cancel",
-        Key::ChkEnable => "Enable",
-        Key::HintImmediate => "Changes apply immediately. No restart needed.",
-        Key::ProcPickerTitle => "Choose processes to ignore gestures",
         Key::BtnOk => "OK",
+        Key::HintImmediate => "Changes apply immediately — no restart needed.",
+        Key::ProcPickerTitle => "Choose processes to ignore gestures",
+        Key::ProcNoTitle => "(untitled)",
         Key::TrayTipDisabled => "anydrag-win (disabled)",
         Key::MenuEnable => "Enable",
         Key::MenuDisable => "Disable",
@@ -184,32 +228,58 @@ fn en(key: Key) -> &'static str {
              half / quarter of the screen\n\n\
              More options (trigger keys, thresholds, excluded processes, middle-drag snap, \
              UI language) are in the tray menu under \"Settings…\".\n\
+             Config file: {}\n\
              Changes apply immediately, no restart needed (either via \"Settings…\" or by \
-             editing the config file directly)."
+             editing the file directly)."
         }
+        Key::ConfigOpenFailed => "Could not open the config file automatically. Open it manually:",
     }
 }
 
+/// 修饰键的显示名。**两套语言相同**：Alt / Ctrl / Shift / Win 是物理键名，
+/// 中文界面里也写 Alt（Windows 自己的中文界面就这么写）。
+///
+/// 放在 i18n 而不是 `settings.rs`：文案只能有一个来源（SPEC D4）。
+pub fn modifier_label(vk: u16) -> &'static str {
+    match vk {
+        0x12 => "Alt",
+        0x11 => "Ctrl",
+        0x10 => "Shift",
+        0x5B => "Win",
+        _ => "",
+    }
+}
+
+/// 四个修饰键（顺序即界面上的显示顺序：Alt / Ctrl / Shift / Win）。
+pub const MODIFIER_VKS: [u16; 4] = [0x12, 0x11, 0x10, 0x5B];
+
 /// 所有 Key（单测穷举用；新增 Key 忘加进这里会被 `every_key_translated` 发现）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub const ALL_KEYS: &[Key] = &[
     Key::WinTitle,
     Key::Subtitle,
-    Key::CardTrigger,
+    Key::LangZh,
+    Key::LangEn,
+    Key::CardDrag,
+    Key::CardResize,
     Key::CardParams,
     Key::CardExcluded,
-    Key::LblDrag,
-    Key::LblResize,
-    Key::LblThreshold,
+    Key::CardExcludedDesc,
+    Key::LblTriggerKeys,
+    Key::LblDragThreshold,
     Key::LblDoubleClick,
     Key::LblMiddleSnap,
     Key::LblMiddleThreshold,
+    Key::ChkEnable,
+    Key::UnitPx,
+    Key::UnitMsSystem,
     Key::BtnPickProcs,
     Key::BtnSave,
     Key::BtnCancel,
-    Key::ChkEnable,
+    Key::BtnOk,
     Key::HintImmediate,
     Key::ProcPickerTitle,
-    Key::BtnOk,
+    Key::ProcNoTitle,
     Key::TrayTipDisabled,
     Key::MenuEnable,
     Key::MenuDisable,
@@ -218,6 +288,7 @@ pub const ALL_KEYS: &[Key] = &[
     Key::MenuConfig,
     Key::MenuQuit,
     Key::UsageBody,
+    Key::ConfigOpenFailed,
 ];
 
 #[cfg(test)]
@@ -237,7 +308,7 @@ mod tests {
         // ALL_KEYS 必须真的覆盖所有变体：用它和 Key 的 Debug 名单核对长度。
         assert_eq!(
             ALL_KEYS.len(),
-            26,
+            33,
             "新增 Key 后请同步 ALL_KEYS 与本断言（当前 {} 条）",
             ALL_KEYS.len()
         );
@@ -246,20 +317,27 @@ mod tests {
     /// 两种语言的译文必须**不同**：这是"漏翻译"的唯一可自动检测特征
     /// （复制粘贴中文再忘了改，界面上看不出来，测试能看出来）。
     ///
-    /// 例外：品牌名、纯符号不在此列 —— 所以这里只跳过明确允许相同的键。
+    /// 例外见 `SAME_IN_BOTH_LANGS`：语言名（"中文"/"English"）按惯例用自身语言写。
     #[test]
     fn translations_actually_differ() {
         for &k in ALL_KEYS {
+            if SAME_IN_BOTH_LANGS.contains(&k) {
+                continue;
+            }
             let (z, e) = (tr(Lang::Zh, k), tr(Lang::En, k));
             assert_ne!(z, e, "{k:?} 中英译文相同，疑似漏翻译");
         }
     }
 
-    /// 中文译文里不该混进 ASCII 字母开头的整句英文（同上，漏翻译的另一种形态）。
+    /// 中文译文里不该混进整句英文（同上，漏翻译的另一种形态）。
     /// 只查"整条不含任何汉字"的情况，避免误伤 "px" / "Alt" / "Ctrl" 这类术语。
     #[test]
     fn chinese_strings_contain_chinese() {
         for &k in ALL_KEYS {
+            // LangEn 的两种译文都是 "English" —— 语言名本就该这样写。
+            if k == Key::LangEn {
+                continue;
+            }
             let s = tr(Lang::Zh, k);
             let has_han = s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
             assert!(has_han, "{k:?} 的中文译文不含汉字：{s:?}");
@@ -292,5 +370,39 @@ mod tests {
             let s = tr(lang, Key::UsageBody);
             assert!(s.lines().count() >= 8, "{lang:?} 用法文本行数太少");
         }
+    }
+
+    /// `UsageBody` 用 `{}` 占位配置文件路径。**必须恰好一个**：
+    /// 少一个 → 路径丢失（用户找不到文件）；多一个 → `format!` 直接 panic。
+    #[test]
+    fn usage_body_has_exactly_one_placeholder() {
+        for lang in [Lang::Zh, Lang::En] {
+            let s = tr(lang, Key::UsageBody);
+            assert_eq!(
+                s.matches("{}").count(),
+                1,
+                "{lang:?} 的用法文本必须恰好含一个 {{}} 占位符"
+            );
+            // 真跑一遍 format，确认没有别的花括号把它撑爆。
+            let out = s.replacen("{}", "C:\\x\\config.json", 1);
+            assert!(out.contains("config.json"));
+        }
+    }
+
+    /// 修饰键名是物理键名，两套语言相同；四个都要有、且互不相同。
+    #[test]
+    fn modifier_labels_are_stable() {
+        let labels: Vec<&str> = MODIFIER_VKS.iter().map(|&v| modifier_label(v)).collect();
+        assert_eq!(labels, vec!["Alt", "Ctrl", "Shift", "Win"]);
+        assert_eq!(modifier_label(0x99), "", "未知 VK 不该编出一个名字");
+    }
+
+    /// 语言名必须各自用自身语言书写（这是 `SAME_IN_BOTH_LANGS` 的存在理由）。
+    #[test]
+    fn language_names_are_self_describing() {
+        assert_eq!(tr(Lang::Zh, Key::LangZh), "中文");
+        assert_eq!(tr(Lang::En, Key::LangZh), "中文");
+        assert_eq!(tr(Lang::Zh, Key::LangEn), "English");
+        assert_eq!(tr(Lang::En, Key::LangEn), "English");
     }
 }

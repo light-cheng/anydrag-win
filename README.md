@@ -73,6 +73,21 @@ target\release\anydrag-win.exe
 "完全无视手势"的进程名单（点「选择进程…」从当前窗口列表勾选，也可手填）。
 **点保存立即生效**——配置热重载到引擎线程，触发键也会同步给鼠标钩子，不需要重启进程。
 
+**界面语言**：右上角「中文 / English」分段按钮，**点了立即变**（不重开窗口、
+不丢已输入的内容）；点「取消」回滚。首次运行跟随系统语言，之后记住你的选择
+（`config.json` 的 `lang` 字段；留空 = 继续跟随系统）。**托盘菜单、tooltip、
+「用法…」弹窗同样双语。**
+
+**深色主题**：跟随系统「应用模式」设置，**切换后窗口立即重绘**（不重启）。
+配色与圆角取自本机 DSH 的样式表实测令牌（`neutral-bluish` 色阶、
+`--dsw-radius-*`、半透明边框预混合成实色、2px 焦点环），不是随手调的灰。
+
+**键盘可用**：Tab / Shift+Tab 在控件间移动，空格切换复选框，回车触发「保存」，Esc 取消。
+
+| 中文 · 浅色 | 英文 · 深色 |
+|---|---|
+| ![中文浅色](docs/spec-assets/settings-after-zh-light.png) | ![英文深色](docs/spec-assets/settings-after-en-dark.png) |
+
 ## 配置
 
 文件：`%APPDATA%\anydrag-win\config.json`（托盘"配置文件…"可直达）。
@@ -89,6 +104,7 @@ target\release\anydrag-win.exe
 | `native_excluded` | 进程名(小写)数组 | `[]` | 名单内应用**完全无视手势**（例如不想被全局钩子打扰的应用）。设置界面点「选择进程…」可从当前可见窗口里勾选，不必手填 exe 名 |
 | `middle_snap` | bool | `true` | 中键方向分屏开关。`false` 时中键完全不干预 |
 | `middle_snap_threshold_px` | 像素 | `40` | 中键拖拽超过它才判定分屏方向；没拖动就松开 = 普通中键点击 |
+| `lang` | 字符串 | `""` | 界面语言：`""` = 跟随系统，`"zh"` / `"en"` = 显式指定 |
 
 进程名示例：`notepad.exe`、`explorer.exe`、`msedge.exe`、`code.exe`。
 
@@ -137,11 +153,12 @@ target\release\anydrag-win.exe
 ## 开发
 
 > **改这个仓库前先读 [`AGENTS.md`](AGENTS.md)** —— 架构不变量、配置热重载机制、
-> 已移除的设计（及为什么移除）、以及 20 条实测踩过的坑（定时器炸弹、背压闩锁死锁、
-> 事件环溢出、异步 placement 不一致态……）都在里面。
+> 已移除的设计（及为什么移除）、以及 26 条实测踩过的坑（定时器炸弹、背压闩锁死锁、
+> 事件环溢出、异步 placement 不一致态、GDI 不吃 alpha、`IsDialogMessageW` 不完成
+> Tab 焦点循环……）都在里面。
 
 ```bash
-cargo test            # 57 个单测（纯逻辑模块零 windows-sys）
+cargo test            # 92 个单测（纯逻辑模块零 windows-sys）
 cmd /c "build.bat"     # release 构建
 ```
 

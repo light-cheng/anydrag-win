@@ -38,6 +38,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config;
+use crate::i18n::{self, Key, Lang};
 use crate::icon;
 
 /// 托盘回调消息（`u32` 自定义 `WM_APP+100`）。
@@ -143,8 +144,17 @@ pub fn install(cfg: &Arc<config::Config>) {
         }
 
         // 托盘消息泵（main 线程，阻塞至 Quit）。
+        //
+        // **`IsDialogMessageW` 不能省**：设置窗口是普通 `WS_OVERLAPPED` 窗口而非
+        // `DialogBox` 建的对话框，系统不会自动处理 Tab 焦点循环 / 回车默认按钮 /
+        // Esc。自绘控件虽有 `WS_TABSTOP`，但焦点转移必须由这个函数驱动 ——
+        // 少了它，用户按 Tab 毫无反应，键盘用户等于用不了设置界面（SPEC V12）。
+        // 返回 true 表示消息已被对话框逻辑消费，不能再 Dispatch（否则控件会被点两次）。
         let mut msg: MSG = core::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if crate::settings::is_dialog_message(&msg) {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -180,19 +190,11 @@ unsafe extern "system" fn wnd_proc(
                 MENU_SETTINGS => crate::settings::open(),
                 MENU_USAGE => {
                     let p = config::file_path().display().to_string();
-                    let text = wstr(&format!(
-                        "anydrag-win 用法\n\n\
-                         按住 Alt：\n\
-                         · 按住鼠标左键拖动 → 移动当前窗口（不限于标题栏，点哪儿拖哪儿）\n\
-                         · 双击（约 0.5 秒内两次、几乎不位移）→ 窗口最大化；已最大化时再双击 → 还原\n\n\
-                         按住 Alt + Ctrl：\n\
-                         · 在窗口任意位置拖动 → 调整窗口大小（方向自动判定，不用瞄边缘）\n\n\
-                         按住鼠标中键：\n\
-                         · 朝某个方向拖拽后松开 → 窗口吸附到该方向的半屏 / 四分之一屏\n\n\
-                         更详细的选项（触发键、阈值、排除名单、中键分屏开关）见托盘菜单「设置…」。\n\
-                         配置文件：{p}\n\
-                         修改后立即生效，无需重启（「设置…」保存或直接手改该文件均可）。",
-                    ));
+                    // 文案统一走 i18n（SPEC D4）：`UsageBody` 含一个 `{}` 占位符，
+                    // 这里把配置文件路径填进去。语言每次现算，保证手改配置后
+                    // 下次点菜单就变（SPEC §4.5）。
+                    let body = i18n::tr(lang(), Key::UsageBody).replacen("{}", &p, 1);
+                    let text = wstr(&body);
                     let cap = wstr("anydrag-win");
                     MessageBoxW(hwnd, text.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
                 }
@@ -213,12 +215,16 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
         return;
     }
     let enabled = config::ENABLED.load(Ordering::Acquire);
+    let l = lang();
     unsafe {
-        let toggle = wstr(if enabled { "禁用" } else { "启用" });
-        let usage_lbl = wstr("用法…");
-        let settings_lbl = wstr("设置…");
-        let config_lbl = wstr("配置文件…");
-        let quit_lbl = wstr("退出");
+        let toggle = wstr(i18n::tr(
+            l,
+            if enabled { Key::MenuDisable } else { Key::MenuEnable },
+        ));
+        let usage_lbl = wstr(i18n::tr(l, Key::MenuUsage));
+        let settings_lbl = wstr(i18n::tr(l, Key::MenuSettings));
+        let config_lbl = wstr(i18n::tr(l, Key::MenuConfig));
+        let quit_lbl = wstr(i18n::tr(l, Key::MenuQuit));
         AppendMenuW(hmenu, MF_STRING, MENU_TOGGLE, toggle.as_ptr());
         AppendMenuW(hmenu, MF_SEPARATOR, 0, 0 as PCWSTR);
         AppendMenuW(hmenu, MF_STRING, MENU_SETTINGS, settings_lbl.as_ptr());
@@ -263,15 +269,23 @@ fn toggle_enabled() -> bool {
 fn set_icon_state(hwnd: HWND, enabled: bool) {
     unsafe {
         let icon = next_icon(enabled);
+        // tooltip 也双语（SPEC §4.5）。启用态只显示品牌名（两语言相同），
+        // 禁用态才需要"已禁用/disabled"的说明。
         let tip = if enabled {
             wstr("anydrag-win")
         } else {
-            wstr("anydrag-win（已禁用）")
+            wstr(i18n::tr(lang(), Key::TrayTipDisabled))
         };
         let mut ni = notify_icon_base(hwnd, icon);
         ni.szTip[..tip.len()].copy_from_slice(&tip);
         Shell_NotifyIconW(NIM_MODIFY, &ni);
     }
+}
+
+/// 当前界面语言。**每次弹菜单/换 tooltip 时现算**，保证手改 `config.json`
+/// 的 `lang` 后下次点击就变（SPEC §4.5）。
+fn lang() -> Lang {
+    crate::winmod::ui_lang(&config::snapshot())
 }
 
 /// `NIM_ADD`/`NIM_MODIFY` 共用的 NOTIFYICONDATAW 基础字段（hIcon/tip 由调用方补）。
@@ -303,7 +317,11 @@ fn open_config_file(hwnd: HWND) {
         ShellExecuteW(hwnd, verb.as_ptr(), path_w.as_ptr(), 0 as PCWSTR, 0 as PCWSTR, 0)
     };
     if (r as isize) <= 32 {
-        let text = wstr(&format!("无法自动打开配置文件，请手动打开：\n{}", p.display()));
+        let text = wstr(&format!(
+            "{}\n{}",
+            i18n::tr(lang(), Key::ConfigOpenFailed),
+            p.display()
+        ));
         let cap = wstr("anydrag-win");
         unsafe {
             MessageBoxW(hwnd, text.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);

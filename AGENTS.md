@@ -35,8 +35,10 @@ hook 线程   WH_MOUSE_LL，回调 O(1) 零堆分配：事件塞 ring + PostThre
    注意 `Target.frame` 是 **DWM 帧**，而 `SetWindowPos` 吃的是**窗口矩形**，两者差左右下
    各约 7px 不可见边框 —— 下发前必须换算（`engine_loop::apply_geom`）。
 3. mask 位规则 = `VK & 0x1F`，类型是 **u32**（`VK & 0x1F` 会产生 bit 16..30，u16 装不下）。
-4. **纯逻辑模块零 `windows-sys` 导入**：`config` / `ring` / `mods` / `engine` / `icon` /
-   `coalesce` / `throttle`。这是可单测性的边界，违反即坏设计。FFI 全在 `winmod.rs`。
+4. **纯逻辑模块零 `windows-sys` 导入**：`config` / `ring` / `mods` / `engine` /
+   `coalesce` / `throttle` / **`theme` / `layout` / `i18n`**。
+   这是可单测性的边界，违反即坏设计。FFI 全在 `winmod.rs`。
+   （`icon.rs` 历史上被误列在此，实际有 FFI —— 见 §7「已知偏差」。）
 5. **所有 FFI 集中在 `winmod.rs`**，其他模块只调它（`hook.rs`/`tray.rs`/`settings.rs` 因
    自身就是 Win32 回调/窗口宿主而例外）。
 6. `RwLock` 读写一律 `unwrap_or_else(|p| p.into_inner())` 就地拆锁。
@@ -78,6 +80,7 @@ hook 线程   WH_MOUSE_LL，回调 O(1) 零堆分配：事件塞 ring + PostThre
 | `native_excluded` | 进程名(小写)数组 | `[]` | 名单内应用**完全无视手势**（不穿透到下层窗口） |
 | `middle_snap` | bool | `true` | 中键方向分屏开关 |
 | `middle_snap_threshold_px` | 像素 | `40` | 两轴位移都小于它 = 普通中键点击，不干预 |
+| `lang` | 字符串 | `""` | 界面语言：`""` = 跟随系统，`"zh"` / `"en"` = 用户显式选择（设置界面的语言按钮写入） |
 
 ### 改动何时生效
 
@@ -130,19 +133,20 @@ hook 线程   WH_MOUSE_LL，回调 O(1) 零堆分配：事件塞 ring + PostThre
 ## 5. 构建、测试、冒烟
 
 ```bash
-cargo test                 # 57 个单测（纯逻辑模块零 windows-sys）
+cargo test                 # 92 个单测（纯逻辑模块零 windows-sys）
 cmd /c "build.bat"         # release 构建（含 rc.exe 图标/manifest 内嵌）
 ```
 
-- **测试**：纯逻辑模块（ring/mods/engine/config/icon/coalesce/throttle/hook 的
-  `mods_match`）可单测；FFI 层不可单测，靠冒烟探针。
+- **测试**：纯逻辑模块（ring/mods/engine/config/coalesce/throttle/hook 的
+  `mods_match`、**theme/layout/i18n**）可单测；FFI 层不可单测，靠冒烟探针。
+  （`icon.rs` 有 FFI，它的 1 条测试只覆盖纯计算部分。）
 - **冒烟探针**：`target/release/probe_gesture.exe`，子命令
   `frame|alt-drag|alt-dbl|ctrl-resize|middle-snap|maximize|native-resize|send-save|close <标题子串>`。
   跑之前它会先确认目标窗在最前，否则直接中止（避免误伤别的窗口）。
 - **诊断日志**：`ANYDRAG_DEBUG=1` 打 stderr。含 `[engine]` 每事件动作、
   `[resolve]` 逐候选跳过原因、`[apply]` 几何下发、`[heartbeat] 1s:` 消息计数
   （`app/timer/other/pending/armed/mods/dropped/state`）—— 心跳仪是判断事件环溢出与
-  状态滞留的第一手指标。
+  状态滞留的第一手指标。设置界面另有 `[settings] dpi=... client=...`。
 
 ### 环境事实
 
@@ -286,16 +290,97 @@ cmd /c "build.bat"         # release 构建（含 rc.exe 图标/manifest 内嵌�
     顺手加了失败日志：取不到图标时 `eprintln!` 报出 `ICON_ID` 与 errno。
     **教训**：`.rc` 里凡是非数字 ID 都先确认它是**真实的宏**；
     资源类 API 失败多半不报错，必须显式打日志。
+22. **`rc.exe` 靠 `INCLUDE` 找头文件，`build.rs` 不能指望它（2026-10-23 实测）**：
+    `assets/app.rc` 里有 `#include <winres.h>`，而 rc.exe 只按 `INCLUDE` 环境变量
+    找头文件。`INCLUDE` 是 `vcvarsall.bat` 设的 —— 从 `build.bat` 构建时它在，
+    但直接跑 `cargo build`（IDE、CI、日常验证）时**不在**，于是 rc.exe 报
+    `RC1015: cannot open include file 'winres.h'`，而 `build.rs` 只打一条
+    `cargo:warning=rc.exe not found or failed` 就跳过 —— 构建"成功"，
+    但 exe 里**既没有图标也没有 manifest**。
+    **manifest 缺失不是外观问题**：它声明 `PerMonitorV2` DPI 感知。缺了之后
+    设置窗口按 96 DPI 建尺寸、`WM_CREATE` 按 144 布局，右半边与下半边被窗口边缘
+    裁掉（截图里一眼可见的"界面被切掉"）。**静默降级，零报错**（坑 #21 同款）。
+    修法：`build.rs` 自己扫 `Windows Kits\10\include\<ver>\{um,shared}` 并逐个
+    传 `/i<dir>`，不依赖 `INCLUDE`。顺手把 `PerMonitorV2` + `dpiAware` 写进
+    `anydrag-win.exe.manifest`（清单声明优先于代码里的 `SetProcessDpiAwarenessContext`）。
+    **教训**：`cargo:warning` 里的"跳过"等于静默失败；凡是"缺了也不报错"的资源，
+    必须有一条构建后校验（本仓的判据：exe 字节里能搜到 `PerMonitorV2`）。
+23. **`IsDialogMessageW` 在普通窗口上不完成 Tab 焦点循环（2026-10-23 实测）**：
+    本仓设置窗口是 `WS_OVERLAPPED` 而非 `DialogBox` 建的对话框，系统**不会**自动
+    处理 Tab/回车/Esc。按 MSDN 的说法在消息泵里调 `IsDialogMessageW` 即可 ——
+    **实测不够**：它对 Tab 返回 TRUE（"我处理了"），但焦点**一动不动**。
+    原因是它内部靠给父窗口发 `WM_NEXTDLGCTL` 来完成移动，而那条消息只有**真正的
+    对话框过程**才认；普通窗口的 `DefWindowProcW` 对它什么都不做。
+    更坑的是：补了 `WM_NEXTDLGCTL` 的处理之后依然不动 —— 那条消息根本没被发出来
+    （`IsDialogMessageW` 在非对话框窗口上提前返回了）。
+    修法：**Tab/Shift+Tab 自己处理**（`settings::is_dialog_message` 里判 `VK_TAB`
+    后调 `next_dlg_ctl`，按 Z 序找下一个 `WS_TABSTOP` + 可见 + 启用的子控件），
+    其余键盘消息仍交给 `IsDialogMessageW`。
+    另：`IsDialogMessageW` 对本窗口的 `WM_TIMER` **也返回 TRUE**，于是定时器消息
+    会被当成"已消费"直接丢掉 —— 所以只把键盘消息（`WM_KEYDOWN/UP`、`WM_CHAR`、
+    `WM_SYS*`）交给它，其余一律不拦。
+    **教训**：`IsDialogMessageW` 的返回值只说明"我认领了这条消息"，**不说明它真的
+    完成了动作**。凡是靠它做键盘可达性的，必须真按一次键验证焦点真的动了。
+24. **`BS_OWNERDRAW` 控件背后会被系统先刷一层 `COLOR_BTNFACE`（2026-10-23）**：
+    自绘按钮在发 `WM_DRAWITEM` **之前**，系统会用 `COLOR_BTNFACE`（浅灰 `#F0F0F0`）
+    把控件矩形填一遍。我们的卡片是白色的，于是复选框文字背后出现一块**灰方块**
+    —— 那正是"Windows 95 观感"的残留，只重绘文字是盖不掉的。
+    修法：`draw_item` 开头先按控件所在位置的真实背景（卡片白 / 窗口灰 / 输入框底）
+    `FillRect` 整块矩形，再画内容。
+    **同款坑**：`WM_DRAWITEM` 给的 `rcItem` 是**设备像素**，而本仓布局全用逻辑像素、
+    绘制辅助函数内部还会再 `scaled()` 一次 —— 不先 `unscaled()` 就会被**二次缩放**，
+    150% DPI 下控件画到右下角外面去（96 DPI 下看着完全正常，极易漏测）。
+25. **GDI `COLORREF` 没有 alpha，DSH 的半透明边框必须先预混合（2026-10-23）**：
+    把 `#0000000a` 直接塞进 `CreatePen` 会被忽略高 8 位，画出来是**纯黑**
+    —— 边框从"几乎看不见"变成"又黑又粗"。`theme::blend(fg, alpha, bg)` 按 sRGB
+    逐通道预混合成实色（与浏览器合成 `rgba()` 的做法一致，观感才对得上 DSH）。
+    配色里凡是"低对比的细边框"都要走它。
+26. **WCAG 对比度必须逐格算，别凭眼估（2026-10-23 两条真缺陷）**：
+    ① 深色主题的主按钮最初写"白字叠 `blue-500`"，算出来只有 **3.68:1**，低于 AA
+    要求的 4.5。DSH 的规则是 `label-primary-foreground` 在深色下取
+    `neutral-bluish-1000`（近黑），改成深色文字后是 5.14:1。
+    ② 复选框未勾选时的方框色 `#adb2b8` 在白卡上只有 **2.13:1**、深色那套
+    `#61666b` 在深卡上 2.71:1 —— 都低于 WCAG 1.4.11 对"控件边界"要求的 3:1，
+    等于框看不见。按同一色阶取深/浅一档后过线。
+    **两条都是单测抓出来的，不是看出来的**。所以 `theme.rs` 里必须有
+    `text_contrast_is_accessible_in_both_themes`（含**悬停态**，只测静止态会漏）
+    与 `checkbox_box_is_visible`。
+    **教训**："某平台能力做不到"要实测（坑 D2 的原话），"这个配色能看清"同样要实测
+    —— 而且要用数字，不是眼睛。
 
 ---
 
 ## 7. 交付物状态
 
-- `cargo test` 57/57。
+- `cargo test` **92/92**。
 - exe 为**单文件**（图标 + manifest 均内嵌 PE 资源段，不依赖任何外部文件）。
+  **manifest 内含 `PerMonitorV2` DPI 感知声明**（见坑 #22）。
 - 三处就位且 MD5 一致：`target/release/`、`%USERPROFILE%\Desktop\`、
   `%LOCALAPPDATA%\Programsnydrag-win\`（开机自启 `.lnk` 指向此处）。
 - 事故与验收记录见 `docs/acceptance.md`。
+
+### 设置界面（2026-10-23 重做）
+
+- 纯逻辑模块 `theme`（DSH 令牌 + `blend()` + WCAG 对比度）、`layout`（唯一坐标来源）、
+  `i18n`（全部文案，中英双语）。
+- 控件策略：**只有 EDIT 是原生**（套 `DarkMode_Explorer` 跟随深色），
+  复选框 / 按钮 / 全部文字自绘（原生 CHECKBOX/STATIC 在深色下不可读，见 SPEC §2.3）。
+- 深色主题跟随系统（`AppsUseLightTheme` + `WM_SETTINGCHANGE`）；
+  高对比度时自绘控件退回原生外观。
+- 托盘菜单 / tooltip / 用法弹窗同样双语。
+- 截图：`docs/spec-assets/settings-after-{zh,en}-{light,dark}.png`。
+
+### 已知偏差（记录在案，不是遗漏）
+
+- `src/icon.rs` 直接调 FFI（8 处 `windows_sys`），**违反不变量 4 的模块清单**。
+  该文件一直列在"纯逻辑模块"里但实际有 FFI —— 本轮未重构（与本 SPEC 无关），
+  未来要么把 FFI 挪进 `winmod`，要么把它从清单里移出。
+- 窗口**标题栏颜色跟随系统强调色**（`ColorPrevalence=1` 时是强调色而非纯深色）。
+  这是 Windows 既定行为：`DWMWA_USE_IMMERSIVE_DARK_MODE` 只影响"深浅"，
+  不影响"是否使用强调色"。
+- SPEC §3.3 原写"主按钮用原生 `BS_DEFPUSHBUTTON`"，但 §3.2/V14 又要求按钮圆角 8px，
+  原生按钮做不到 —— 取后者（可见的视觉结果优先），按钮也自绘。已在
+  `settings.rs` 模块注释记明。
 
 ## 8. 改这个仓库时的默认流程
 

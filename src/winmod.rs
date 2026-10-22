@@ -500,3 +500,156 @@ pub fn fallback_resize(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
         sync_paint(hwnd_ptr);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 设置界面的外观支持（深色主题 / 系统语言 / 控件主题 / 高对比度）
+//
+// 这几项都只被 `settings.rs` 用，但按不变量 5 **仍然放在 winmod**：
+// 除 `settings.rs`/`tray.rs`（自身即窗口宿主的既有例外）外不引入新的 FFI 落点。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 系统是否使用**深色应用主题**（读 `HKCU\...\Themes\Personalize\AppsUseLightTheme`，
+/// 值为 0 = 深色）。
+///
+/// **为什么读注册表而不是别的**（SPEC §2.3 实测）：`GetSysColor(COLOR_WINDOW)`
+/// 不会随"应用深色模式"变（那是 `SystemUsesLightTheme` 管的任务栏/开始菜单），
+/// 而 `AppsUseLightTheme` 才是设置里"默认应用模式"那一个开关。
+///
+/// 读不到（键不存在 / 老系统 / 被策略拦）→ **按浅色处理**，不报错：深色是增强项，
+/// 拿不到就当没有，绝不能因为读注册表失败让设置窗口打不开。
+pub fn system_dark_mode() -> bool {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    const VALUE: &str = "AppsUseLightTheme";
+    let sub = wstr(SUBKEY);
+    let name = wstr(VALUE);
+    let mut data: u32 = 1; // 默认浅色
+    let mut cb = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut c_void,
+            &mut cb,
+        )
+    };
+    if rc != 0 {
+        // 0 = ERROR_SUCCESS。失败一律浅色（见上方注释），调试时能看出来为什么。
+        if std::env::var_os("ANYDRAG_DEBUG").is_some() {
+            eprintln!("[theme] RegGetValueW(AppsUseLightTheme) failed rc={rc}, assuming light");
+        }
+        return false;
+    }
+    data == 0
+}
+
+/// 系统 UI 语言是否中文（`GetUserDefaultUILanguage` 的主语言 ID == 0x04）。
+///
+/// LANGID 的低 10 位是主语言 ID：简体 `0x0804`、繁体 `0x0404` / `0x0C04` 都命中 0x04。
+///
+/// **与不变量 1 无关**：`dpi_aware_v2()` 仍是进程第一个 FFI 调用，本函数只是普通调用。
+pub fn system_is_chinese() -> bool {
+    use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    langid & 0x3FF == 0x04
+}
+
+/// 当前界面语言 = 配置里的 `lang`（显式选择优先）+ 系统语言（空串时跟随）。
+///
+/// **为什么放在 `winmod` 而不是 `config`**：`config` 是纯逻辑模块（不变量 4），
+/// 而这里要调 `GetUserDefaultUILanguage`。放在 `winmod` 还有一个好处：
+/// `settings.rs` 与 `tray.rs` 共用**同一处**语言解析，不会出现"窗口跟着配置变、
+/// 托盘还按旧语言画"这种坑 #18 式的双实现。
+pub fn ui_lang(cfg: &Config) -> crate::i18n::Lang {
+    crate::i18n::Lang::from_config(&cfg.lang, system_is_chinese())
+}
+
+/// 给控件套深色主题（`SetWindowTheme(h, "DarkMode_Explorer", NULL)`）。
+///
+/// **SPEC §2.3 实测结论**：这招对 `EDIT` 与 `BUTTON` **确实有效**（白底黑字 →
+/// 深底浅字），对 `CHECKBOX` / `STATIC` 无效（而且套了之后 CHECKBOX 变成
+/// "白底浅字"，比不套更糟）。所以本工具只对 EDIT/BUTTON 调它，
+/// 复选框与全部静态文字改自绘。
+///
+/// `dark == false` 时传空串复位成默认主题（切回浅色要显式复位，否则控件
+/// 会一直停在深色 —— 主题切换不会自动发生，SPEC §3.4）。
+pub fn set_window_theme(hwnd: isize, dark: bool) {
+    use windows_sys::Win32::UI::Controls::SetWindowTheme;
+    if hwnd == 0 {
+        return;
+    }
+    // 空串 = 复位成系统默认；NULL = "不做任何改变"，两者语义不同，别传错。
+    let theme = wstr(if dark { "DarkMode_Explorer" } else { "" });
+    unsafe {
+        SetWindowTheme(hwnd as HWND, theme.as_ptr(), std::ptr::null());
+    }
+}
+
+/// 系统是否开着**高对比度**主题。
+///
+/// 自绘控件在高对比度下必须**退回原生外观**：用户开高对比度就是为了让系统
+/// 用自己的配色覆盖一切，此时按我们的调色板画等于破坏无障碍设置（SPEC §9）。
+pub fn high_contrast() -> bool {
+    use windows_sys::Win32::UI::Accessibility::{HIGHCONTRASTW, HCF_HIGHCONTRASTON};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETHIGHCONTRAST};
+    unsafe {
+        let mut hc: HIGHCONTRASTW = std::mem::zeroed();
+        hc.cbSize = std::mem::size_of::<HIGHCONTRASTW>() as u32;
+        let ok = SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            &mut hc as *mut HIGHCONTRASTW as *mut c_void,
+            0,
+        );
+        ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+}
+
+/// 窗口所在显示器的 DPI。
+///
+/// **为什么不用 `GetDpiForSystem()`**：那个返回的是"主屏 DPI"，多屏且各屏
+/// 缩放不同时，设置窗口被拖到副屏后会按主屏的比例布局 → 控件被裁切或留大片空白
+/// （SPEC V5 要求 120/144/192 三档都不裁切）。Per-Monitor-v2 进程里
+/// `GetDpiForWindow` 返回该窗口当前所在屏的 DPI，才是正确的那一个。
+///
+/// **`hwnd == 0` 时返回 96 是错的**，见 `system_dpi` 的注释 —— 建窗口**之前**
+/// 只有 `system_dpi()` 可用，别用本函数。
+pub fn dpi_for_window(hwnd: isize) -> i32 {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    if hwnd == 0 {
+        // 调用方在建窗口前就问 DPI —— 那是 `system_dpi` 的职责。
+        // 这里不能返回 96：在 150% 的机器上会按 96 算尺寸，随后
+        // WM_CREATE 按 144 布局，控件直接被窗口右/下边缘裁掉。
+        return system_dpi();
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd as HWND) };
+    if dpi == 0 {
+        system_dpi()
+    } else {
+        dpi as i32
+    }
+}
+
+/// 系统 DPI（**建窗口之前**唯一可用的那个）。
+///
+/// 本进程是 Per-Monitor-v2 感知，所以 `GetDpiForSystem()` 返回的是主屏真实 DPI
+/// （150% 缩放下是 144，不是 96）。`CreateWindowExW` 的宽高必须在**创建前**
+/// 算好，那时还没有 hwnd，只能用这个。
+pub fn system_dpi() -> i32 {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 {
+        96
+    } else {
+        dpi as i32
+    }
+}
+
+/// `wstr` 的本地副本（本文件的其余函数都在 `settings.rs` 里自己拼串，
+/// 新加的这几个需要 NUL 结尾的宽串）。
+fn wstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}

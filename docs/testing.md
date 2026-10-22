@@ -159,9 +159,20 @@ git diff --ignore-all-space --stat
 cargo test 2>&1 | tail -30
 ```
 
-**期望**：`test result: ok. 57 passed; 0 failed`
+**期望**：`test result: ok. 92 passed; 0 failed`
 
-分布应为：`coalesce 6 / config 5 / engine 28 / hook 2 / icon 1 / mods 3 / ring 3 / throttle 9`
+分布（用编译器真实输出分组统计，**不要**用 `grep -c '#[test]'`，见 AGENTS 坑 #20）：
+
+```
+coalesce 6 / config 6 / engine 28 / hook 2 / i18n 8 / icon 1 /
+layout 11 / mods 3 / ring 3 / settings 6 / theme 9 / throttle 9   = 92
+```
+
+> 2026-10-23 新增 `theme`（配色令牌 + `blend()` + WCAG 对比度）、
+> `layout`（唯一坐标来源 + 几何不变量）、`i18n`（全部文案，中英双语）、
+> `settings`（控件 id / 卡片标题映射）四个模块的 34 条测试；
+> `config` 新增 1 条（旧配置缺 `lang` 字段仍能加载）。
+> 测试数**只增不减**，改完请用 `cargo test` 的真实汇总行核对。
 
 ### 4.1 重点测试 A：空 modifiers 不得触发手势
 
@@ -339,6 +350,58 @@ cd target/release
 ./probe_gesture.exe maximize notepad   # 避免留下半屏窗口
 ./probe_gesture.exe close notepad      # 关掉测试窗
 ```
+
+### 6.3 设置界面外观与交互验收（2026-10-23 新增，必跑）
+
+对应 `docs/spec-2026-10-23-gui-i18n.md` §5.2 的 V1–V15。**截图不接受"看着还行"**，
+四张都要有：中文浅色 / 英文浅色 / 中文深色 / 英文深色。
+
+```powershell
+# 前置：exe 必须是 Medium IL（见 §2.1），否则托盘装不上、窗口也起不来
+# 四张截图（窗口置顶后截屏；PrintWindow 抓不到子控件，必须用 CopyFromScreen）
+```
+
+| # | 检查 | 判据 | 怎么验 |
+|---|---|---|---|
+| V1 | 无控件压在错误的卡片上 | 每个标签/控件都落在其所属卡片的白色区域内 | 目视 + `layout.rs` 的 `every_control_lives_in_its_card` 单测 |
+| V2 | 无死空白 | 窗口底边距 ≈ 20px | 目视；`window_height_is_content_driven` 单测 |
+| V3 | 卡片标题与首行不相贴 | 能分辨"标题行"与"内容行" | 目视 |
+| V4 | 正文 14px / 标题 Semibold | `grep -n DEFAULT_GUI_FONT src/settings.rs` **必须为空** | 命令 |
+| V5 | 120/144/192 DPI 均不被裁切 | 客户区宽度 == `560 * dpi / 96` | 见下方实测值 |
+| V6 | **四张**截图 | 英文下任一标签不被截断成 "…" | 目视 |
+| V7 | 语言切换不需重开窗口 | 点按钮立即变 | 点「English」看标题/按钮是否立刻变 |
+| V8 | 点「取消」后语言回滚 | 重新打开仍是旧语言 | 切语言 → 取消 → 重开 |
+| V9 | 单位后缀跟随输入框 | "5 像素"成一组 | 目视 |
+| V10 | **深色下没有"白底浅字/白底黑字"控件** | EDIT 深底浅字、复选框深底浅字、按钮深底浅字 | 深色截图逐控件核对 |
+| V11 | 切系统主题后窗口跟着变（不重启） | 系统设置里切深浅 → 窗口立即重绘 | 见下方脚本 |
+| V12 | 复选框自绘后**键盘可用** | Tab 聚焦 → 空格能切换；焦点环可见 | 见下方脚本 |
+| V13 | 配色与 DSH 一致 | 中性色阶观感接近；**不得出现纯灰 `#808080`** | 并排目视 |
+| V14 | 圆角符合刻度 | 卡片 12 / 输入框 8 / 复选框 4 | 截图放大目视 |
+| V15 | 深色下卡片边框可辨但不刺眼 | 不是纯黑粗线（说明 alpha 预混合了） | 深色截图目视 |
+
+**V5 实测值（本机 144 DPI，2026-10-23）**：
+
+```
+[settings] dpi=144 client=840x1101     # 进程自报
+GetClientRect  = 840x1101              # 外部测量一致
+期望 = 560*144/96 = 840                # ✅
+```
+
+> **注意：测 DPI/截图的那一侧也必须声明 PerMonitorV2 感知**。
+> PowerShell 默认是 DPI-unaware，`GetWindowRect` 会返回被系统虚拟化过的
+> 96 DPI 值（窗口明明 840x1101，它说 575x771），`CopyFromScreen` 也只取到
+> 左上角一块 —— 看起来像"界面被裁掉"，其实是被截断的。
+> 脚本开头必须 `SetProcessDpiAwarenessContext(-4)`。
+> （同款坑还有：`FindWindowW(cls, $null)` 从 PowerShell 传 `$null` 会被封送成
+> 空串而非 NULL，于是永远找不到窗口 —— 改用 `EnumWindows` 按类名匹配。）
+
+**V11 手动验法**：打开设置窗口 → 系统设置 → 个性化 → 颜色 → 「选择默认应用模式」
+切浅/深 → **设置窗口应当立即变色**，不需要关掉重开。
+（实现：`WM_SETTINGCHANGE` + `lParam == "ImmersiveColorSet"` → 重取
+`AppsUseLightTheme` → 重套 EDIT/BUTTON 主题 + `InvalidateRect` 全窗重绘。）
+
+**V12 手动验法**：点一下设置窗口 → 按 Tab（焦点环应出现在第一个复选框上）→
+再按 Tab（应移到第二个）→ 按空格（勾选状态应翻转）。
 
 ---
 

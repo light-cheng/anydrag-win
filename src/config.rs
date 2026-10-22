@@ -157,6 +157,12 @@ pub struct Config {
     pub middle_snap: bool,
     /// 中键分屏的方向判定阈值（px）：拖拽位移两个轴都小于它 = 普通中键点击。
     pub middle_snap_threshold_px: u32,
+    /// 界面语言：`""` = 跟随系统（首次运行/旧配置），`"zh"` / `"en"` = 用户显式选择。
+    ///
+    /// **为什么存字符串而不是枚举**（SPEC §4.2）：`Config` 是对外的手改格式，
+    /// 存 `"zh"`/`"en"` 比存数字可读、手改不易错，也与 `native_excluded` 风格一致。
+    /// 解析失败（未知值）由 `i18n::Lang::from_config` 兜底成"跟随系统"，不会 panic。
+    pub lang: String,
 }
 
 // Default 手写而非 derive：derive 会给 enabled=false / modifiers=[]，
@@ -172,6 +178,7 @@ impl Default for Config {
             native_excluded: Vec::new(),
             middle_snap: true,
             middle_snap_threshold_px: 40,
+            lang: String::new(),
         }
     }
 }
@@ -297,9 +304,45 @@ mod tests {
         let mut c = Config::default();
         c.native_excluded.push("notepad.exe".into());
         c.double_click_ms = Some(350);
+        c.lang = "en".into();
         save_to(&c, &path).unwrap();
         let back = load_from(&path);
         assert_eq!(c, back, "save→load must be identity");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **旧配置必须能加载**（SPEC §4.2）：`lang` 是后加字段，用户手上已有的
+    /// `config.json` 里没有它。`#[serde(default)]` 让它落到空串 = 跟随系统。
+    ///
+    /// 这条钉住的是"升级不炸"—— 加字段时最容易忘的就是这个，而一旦忘了，
+    /// 所有老用户的配置都会解析失败并静默退回默认值（等于把用户的设置全清了）。
+    #[test]
+    fn old_config_without_lang_still_loads() {
+        let dir = tmp_dir("legacy_lang");
+        let path = dir.join("config.json");
+        // 2026-10-22 之前的真实字段集，**故意不含 lang**。
+        let legacy = r#"{
+            "enabled": false,
+            "modifiers": [17],
+            "resize_modifiers": [16, 17],
+            "drag_threshold_px": 9,
+            "double_click_ms": 420,
+            "native_excluded": ["game.exe"],
+            "middle_snap": false,
+            "middle_snap_threshold_px": 55
+        }"#;
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(legacy.as_bytes()).unwrap();
+        let c = load_from(&path);
+        // 旧字段全部保留（不是退回默认值）。
+        assert!(!c.enabled, "旧配置的 enabled=false 必须保留");
+        assert_eq!(c.modifiers, vec![17]);
+        assert_eq!(c.drag_threshold_px, 9);
+        assert_eq!(c.double_click_ms, Some(420));
+        assert_eq!(c.native_excluded, vec!["game.exe".to_string()]);
+        assert!(!c.middle_snap);
+        // 新字段落到"跟随系统"。
+        assert_eq!(c.lang, "", "缺失的 lang 必须是空串（= 跟随系统）");
         let _ = fs::remove_dir_all(&dir);
     }
 

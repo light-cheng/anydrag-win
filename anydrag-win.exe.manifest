@@ -22,4 +22,25 @@
         language="*"/>
     </dependentAssembly>
   </dependency>
+
+  <!--
+    DPI 感知（2026-10-23 补）：**清单里的声明优先于代码里的 API 调用**。
+
+    代码里 `winmod::dpi_aware_v2()` 已经调了 `SetProcessDpiAwarenessContext`，
+    但清单是进程启动时由加载器读的，比 `main` 更早生效 —— 两处都写才最稳：
+    清单保证"第一个窗口创建前就已经感知 DPI"，代码调用在清单已声明时会
+    静默返回 FALSE（无害），在清单缺失时补上。
+
+    少了这一节会怎样（实测）：150% 缩放下 `GetWindowRect` 等 API 对
+    **本进程**返回虚拟化后的 96 DPI 坐标，设置窗口按 840x1101 建出来、
+    外部测量却只有 575x771，截图工具（DPI-unaware 的 PowerShell）也只能
+    截到窗口的左上角一块 —— 看起来像"界面被裁掉"，其实是测量/截图那一侧
+    被虚拟化了。写进清单后所有进程看到的是同一套物理像素。
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
 </assembly>
