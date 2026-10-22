@@ -14,17 +14,19 @@
 //! u16（bit 0..15）装不下——const 求值直接报 E0080。故 mask 全线加宽为 u32
 //! （bit 规则本身不变，仍是 `VK & 0x1F`）。
 
-/// `required` 中每个 VK 的 mask bit 是否全部在 `down_mask` 中置位。
-/// `required` 为空 = 永不触发（返回 false）。
-pub fn matches(down_mask: u32, required: &[u16]) -> bool {
-    if required.is_empty() {
-        return false;
-    }
-    let mut mask = 0u32;
-    for &vk in required {
-        mask |= 1u32 << (vk & 0x1F);
-    }
-    down_mask & mask == mask
+/// 修饰键是否满足要求（本模块**唯一**的判定入口）。
+///
+/// **`required_mask == 0` 必须返回 false**（= 永不触发）。这一条是**安全底线**，
+/// 不是口味问题：`down_mask & 0 == 0` 恒真，若照位运算直译，空列表就等于
+/// "任何一次鼠标点击都拖动窗口"。2026-10-22 审查发现生产路径正是这么写的
+/// （`engine::feed` 内联闭包 `m & mask == mask`），而这里带测试的判定函数
+/// 反而没有调用点——两个实现给出相反语义，生效的恰好是没测试的那个。
+///
+/// 现在 `engine` 的三条路径（拖动 Down / resize Down / ArmedResize 提交）全部走本函数，
+/// 语义只有一处定义。**不要再提供一个接受 `&[u16]` 的平行版本**：那正是本坑的成因
+/// （VK 列表 → mask 的折算已由 `config::mask_of` 负责，不必在此重复）。
+pub fn matches_mask(down_mask: u32, required_mask: u32) -> bool {
+    required_mask != 0 && down_mask & required_mask == required_mask
 }
 
 #[cfg(test)]
@@ -37,20 +39,47 @@ mod tests {
     const CTRL: u32 = 1u32 << 17;
     const SHIFT: u32 = 1u32 << 16;
 
+    /// 把 VK 列表折算成 mask——**与生产路径同一个函数**（`config::mask_of`）。
+    /// 测试若自带一份折算逻辑，就又会变成"两个实现"（见 `matches_mask` 注记）。
+    fn mask(vks: &[u16]) -> u32 {
+        crate::config::mask_of(vks)
+    }
+
     #[test]
     fn mods_alt_alone_triggers() {
-        assert!(matches(ALT, &[0x12]), "Alt alone must trigger [Alt]");
-        assert!(!matches(0, &[0x12]), "no keys must not trigger");
-        assert!(!matches(ALT, &[]), "empty required never triggers");
+        assert!(matches_mask(ALT, mask(&[0x12])), "Alt alone must trigger [Alt]");
+        assert!(!matches_mask(0, mask(&[0x12])), "no keys must not trigger");
+        assert!(!matches_mask(ALT, mask(&[])), "empty required never triggers");
     }
 
     #[test]
     fn mods_combo_required_and_extra_keys_allowed() {
         // 配置 [Alt, Ctrl]：两者齐全才触发。
-        assert!(matches(ALT | CTRL, &[0x12, 0x11]), "Alt+Ctrl must trigger [Alt, Ctrl]");
-        assert!(!matches(ALT, &[0x12, 0x11]), "missing Ctrl must not trigger [Alt, Ctrl]");
-        assert!(!matches(CTRL, &[0x12, 0x11]), "missing Alt must not trigger [Alt, Ctrl]");
+        let ac = mask(&[0x12, 0x11]);
+        assert!(matches_mask(ALT | CTRL, ac), "Alt+Ctrl must trigger [Alt, Ctrl]");
+        assert!(!matches_mask(ALT, ac), "missing Ctrl must not trigger [Alt, Ctrl]");
+        assert!(!matches_mask(CTRL, ac), "missing Alt must not trigger [Alt, Ctrl]");
         // 多余按键不阻挡（YAGNI）：配置 [Alt] 时按着 Shift 也照样触发。
-        assert!(matches(ALT | SHIFT, &[0x12]), "extra keys must not block (YAGNI)");
+        assert!(
+            matches_mask(ALT | SHIFT, mask(&[0x12])),
+            "extra keys must not block (YAGNI)"
+        );
+    }
+
+    /// 回归（2026-10-22）：`required_mask == 0` 绝不能被位运算直译成"恒真"。
+    ///
+    /// 生产路径（`engine::feed`）历史上用的是内联 `m & mask == mask`，于是
+    /// `modifiers: []` 让每一次鼠标点击都变成拖动窗口。这条断言钉住它。
+    #[test]
+    fn empty_required_mask_never_triggers() {
+        // 0 永远不匹配，哪怕 down_mask 也是 0（`0 & 0 == 0` 的陷阱就在这里）。
+        assert!(!matches_mask(0, 0), "empty required mask must never match");
+        assert!(!matches_mask(ALT | CTRL, 0), "empty required mask ignores down keys");
+        // 经 VK 列表折算后同样为 0，语义必须一致。
+        assert_eq!(mask(&[]), 0, "empty VK list must fold to mask 0");
+        assert!(!matches_mask(ALT | CTRL, mask(&[])), "empty list must not trigger");
+        // 非空 mask 的正常路径不受影响。
+        assert!(matches_mask(ALT, mask(&[0x12])));
+        assert!(!matches_mask(ALT, mask(&[0x11])), "Alt must not satisfy a Ctrl requirement");
     }
 }

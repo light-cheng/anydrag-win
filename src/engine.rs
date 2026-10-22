@@ -307,7 +307,11 @@ impl DragState {
         resolve: &dyn Fn(i32, i32) -> Option<Target>,
         cfg: &EngineCfg,
     ) -> Vec<Action> {
-        let mods_ok = |m: u32| m & cfg.modifiers_mask == cfg.modifiers_mask;
+        // **必须走 mods::matches_mask，不能内联写成 `m & mask == mask`**：
+        // 后者在 `modifiers: []`（mask=0）时恒为真，等于"任何一次鼠标点击都拖窗口"。
+        // 而 mods.rs 对空列表的语义是"永不触发"（有测试钉住）。两条路径历史上不一致，
+        // 生效的恰好是没测试的那条（2026-10-22 审查）。现在语义只有一处定义。
+        let mods_ok = |m: u32| crate::mods::matches_mask(m, cfg.modifiers_mask);
 
         match ev {
             EngineEvent::Down { x, y, mods } => {
@@ -316,7 +320,7 @@ impl DragState {
                 // `resize_edges_for` 按九宫格/就近角判定（不需要贴边，见其注释）。
                 // 最大化窗口返回 edges=0 ⇒ 落到常规路径（仍可拖）。
                 // 单按 Alt（拖拽键）永远走常规路径，不触发 resize。
-                if cfg.resize_mask != 0 && *mods & cfg.resize_mask == cfg.resize_mask {
+                if crate::mods::matches_mask(*mods, cfg.resize_mask) {
                     if let Some(target) = resolve(*x, *y) {
                         let edges = resize_edges_for(&target, *x, *y);
                         if edges != 0 {
@@ -431,8 +435,11 @@ impl DragState {
                     // 与 Down 时刻判定必然一致）。
                     DragState::ArmedResize { target, start } => {
                         let th = cfg.threshold_px as i64;
-                        if *mods & cfg.resize_mask != cfg.resize_mask {
+                        if !crate::mods::matches_mask(*mods, cfg.resize_mask) {
                             // 修饰不齐（松开触发键）→ 本事件无动作、状态保留（与移动路径同语义）。
+                            // **也覆盖"手势中途热重载把 resize_modifiers 改成 []"**：
+                            // mask=0 时 matches_mask 恒假，于是这里判成"不齐"而不再提交，
+                            // 而不是被位运算直译成"齐了"继续缩放。
                             (vec![Action::None], None)
                         } else if dist_sq([*x, *y], *start) < th * th {
                             (vec![Action::None], None)
@@ -618,6 +625,31 @@ mod tests {
         let cfg = EngineCfg::test();
         let a = s.feed(&down(10, 10, 0), &resolve_ok(false), &cfg);
         assert_eq!(a, vec![Action::None]);
+        assert!(matches!(s, DragState::Idle));
+    }
+
+    /// 回归（2026-10-22）：`modifiers: []`（mask=0）必须是"永不触发"，而不是
+    /// "任何点击都触发"。旧实现内联 `m & mask == mask`，空 mask 恒真 ⇒ 用户把触发键
+    /// 全取消勾选后，随手点一下鼠标就把窗口拖走了，且**毫无报错**。
+    /// 空列表是设置界面的合法状态（四个复选框都不勾），必须钉住。
+    #[test]
+    fn engine_empty_modifiers_mask_never_triggers() {
+        let mut s = DragState::Idle;
+        let mut cfg = EngineCfg::test();
+        cfg.modifiers_mask = 0; // = modifiers: []
+        // 无按键、有按键都不该 arm。
+        assert_eq!(s.feed(&down(100, 200, 0), &resolve_ok(false), &cfg), vec![Action::None]);
+        assert!(matches!(s, DragState::Idle), "mask=0 must not arm even with no keys held");
+        assert_eq!(
+            s.feed(&down(100, 200, MOD_ALT), &resolve_ok(false), &cfg),
+            vec![Action::None]
+        );
+        assert!(matches!(s, DragState::Idle), "mask=0 must not arm even with Alt held");
+        // 后续 Move 也不该凭空提交拖动。
+        assert_eq!(
+            s.feed(&move_(140, 200, MOD_ALT), &resolve_ok(false), &cfg),
+            vec![Action::None]
+        );
         assert!(matches!(s, DragState::Idle));
     }
 

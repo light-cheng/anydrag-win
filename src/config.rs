@@ -96,20 +96,30 @@ pub fn reload_if_changed() -> bool {
 }
 
 /// 取当前配置的快照（未 `init` 时返回默认值，保证任何调用顺序都不 panic）。
+///
+/// 锁中毒时**就地拆锁**（`unwrap_or_else(|p| p.into_inner())`），绝不 `if let Ok`
+/// 静默跳过——静默跳过会让 engine 拿到默认值而毫无异常，正是 2026-10-20
+/// "手势全灭但进程毫无异常"的同款死法（AGENTS.md §1 不变量 6）。
 pub fn snapshot() -> Config {
     match STORE.get() {
-        Some(lock) => lock.read().map(|c| c.clone()).unwrap_or_default(),
+        Some(lock) => lock
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
         None => Config::default(),
     }
 }
 
 /// 用新配置替换当前生效值（热重载），并自增版本号唤醒读方。
 /// **不写盘**——写盘由调用方显式 `Config::save()`（设置界面保存按钮负责）。
+///
+/// 与 `snapshot` 同理：中毒时就地拆锁写入。若在这里静默跳过，`VERSION` 仍会自增，
+/// 于是 engine 每批都判定"配置变了"却每次都读到旧值——故障永久化且零报错。
 pub fn replace(cfg: Config) {
     if let Some(lock) = STORE.get() {
-        if let Ok(mut w) = lock.write() {
-            *w = cfg;
-        }
+        *lock
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = cfg;
     }
     VERSION.fetch_add(1, Ordering::Release);
     // 记住"这是我们自己写的"：否则 reload_if_changed 会把本次写入误判成外部编辑，
