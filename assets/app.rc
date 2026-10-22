@@ -1,10 +1,26 @@
 // 应用图标资源。
 // 用 rc.exe 编译成 .res，再由 build.rs 通过 cargo:rustc-link-arg 链进 exe。
-// IDI_ICON1 = 32512，Windows 用这个 ID 作为"应用图标"（Explorer/任务栏/Alt+Tab）。
+//
+// **ID 必须是数字 1，绝不能写 `IDI_ICON1`**（2026-10-23 实测修，见 AGENTS.md 坑 #21）：
+// `IDI_ICON1` 是 **winres.h 里没有定义的标识符**（已全盘搜过 Windows SDK
+// 10.0.22621.0 的 Include，无此宏）。rc.exe 对未定义标识符**不报错**，而是把它当作
+// **字符串名**处理 —— 于是资源变成 `RT_GROUP_ICON` 下的命名项 `"IDI_ICON1"`，
+// 而不是某个数字 ID 的项。
+//
+// 后果（实测）：`LoadImageW(hInstance, 32512, IMAGE_ICON, ...)` **恒返回 NULL**，
+// 托盘于是退回系统通用图标（灰扑扑的默认窗口图标）。而 Explorer 的文件图标却正常 ——
+// Explorer 按 RT_GROUP_ICON 的**第一项**取，不关心名字。于是症状是
+// "exe 图标对、托盘图标丑"，两边都**没有任何报错**（坑 #2 的同款：
+// 图标句柄为 NULL 时 `NIM_ADD` 仍然成功，只是托盘上显示的是错的图）。
+//
+// 用数字 `1` 同时满足两件事：
+// ① 它是应用图标最惯用的 ID，Explorer / 任务栏 / Alt+Tab 都认；
+// ② 程序里能用 `MAKEINTRESOURCE(1)` 精确取到它（见 `src/icon.rs` 的 `ICON_ID`）。
+// 注意它和下面 manifest 的 `1` 不冲突：资源按 (类型, ID) 唯一定位，类型不同。
 
 #include <winres.h>
 
-IDI_ICON1 ICON "anydrag-win.ico"
+1 ICON "anydrag-win.ico"
 
 // comctl32 v6 视觉样式清单，作为 RT_MANIFEST 资源内嵌（2026-10-21）。
 // RT_MANIFEST = 24；ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID（进程级清单）。

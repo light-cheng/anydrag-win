@@ -269,6 +269,23 @@ cmd /c "build.bat"         # release 构建（含 rc.exe 图标/manifest 内嵌�
     `grep -cE '^[[:space:]]*#\[test\][[:space:]]*$'`。
     **教训**：统计类断言（测试数、行数、条数）要么用编译器/工具的真实输出，
     要么用能锚定行首行尾的精确模式；否则数字会一路复制到文档里没人再核对。
+21. **`assets/app.rc` 里的资源 ID 必须写数字，不能写 `IDI_ICON1`（2026-10-23 用户报障）**：
+    用户原话"托盘图标能不能也用程序图标？这个原来没改啊，好丑"。
+    排查发现 `IDI_ICON1` **不是 Windows SDK 的宏**（全盘搜过
+    `Windows Kits\10\Include\10.0.22621.0` 的 `winres.h` 与所有头文件，没有它），
+    rc.exe 对未定义标识符**不报错**，而是把它当作**字符串名** —— 资源就变成
+    `RT_GROUP_ICON` 下的命名项 `"IDI_ICON1"`，而不是 ID=32512 的数字项。
+    后果链条：
+    ① `LoadImageW(hInstance, 32512, IMAGE_ICON, …)` **恒返回 NULL**；
+    ② 托盘退回系统通用图标（`hIcon` 落在 `0x1002b` 这类共享句柄区间），
+       而 **`NIM_ADD` 仍然返回成功** —— 与坑 #2 完全同款：静默失败；
+    ③ Explorer 的文件图标却**是对的**（它按 `RT_GROUP_ICON` 第一项取，不看名字），
+       于是症状是"exe 图标对、托盘图标丑"，两边都没有任何报错。
+    修法：`app.rc` 里写 `1 ICON "anydrag-win.ico"`（数字 1，与 manifest 的 `1 24` 不冲突
+    —— 资源按 (类型, ID) 唯一定位），代码里用 `MAKEINTRESOURCE(1)` 取。
+    顺手加了失败日志：取不到图标时 `eprintln!` 报出 `ICON_ID` 与 errno。
+    **教训**：`.rc` 里凡是非数字 ID 都先确认它是**真实的宏**；
+    资源类 API 失败多半不报错，必须显式打日志。
 
 ---
 
