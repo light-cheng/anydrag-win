@@ -130,7 +130,7 @@ hook 线程   WH_MOUSE_LL，回调 O(1) 零堆分配：事件塞 ring + PostThre
 ## 5. 构建、测试、冒烟
 
 ```bash
-cargo test                 # 55 个单测（纯逻辑模块零 windows-sys）
+cargo test                 # 57 个单测（纯逻辑模块零 windows-sys）
 cmd /c "build.bat"         # release 构建（含 rc.exe 图标/manifest 内嵌）
 ```
 
@@ -237,12 +237,44 @@ cmd /c "build.bat"         # release 构建（含 rc.exe 图标/manifest 内嵌�
 17. **ListBox 消息号与返回值语义**：`LB_SETSEL`=0x185（wParam=BOOL，lParam=index）、
     `LB_GETSEL`=0x187（wParam=index）。`LB_SETSEL` **成功时返回 0**，
     别把 0 当失败；`LB_GETSEL` 失败返回 `LB_ERR`(-1)，判断选中要用 `> 0`。
+18. **同一语义有两个实现 = 生效的那个没测试（2026-10-22 审查发现）**：
+    `mods::matches` 对空列表返回 false（"永不触发"，有测试钉住），但**没有任何调用点**；
+    生产路径 `engine::feed` 用的是内联闭包 `m & mask == mask`，而 mask=0 时
+    `0 & 0 == 0` **恒真** ⇒ 用户把四个触发键复选框全取消（设置界面的合法状态）后，
+    **随手点一下鼠标就把窗口拖走**，且毫无报错。
+    这正是不变量 4 想防的反面：有测试的模块不参与生产，参与生产的逻辑没有测试。
+    修法：抽出 `mods::matches_mask(down, required)`，`required==0 → false` 一处定义，
+    `matches` 与 `engine` 三条路径（拖动 Down / resize Down / ArmedResize 提交）
+    全部改走它，并补 `empty_required_mask_never_triggers` 与
+    `engine_empty_modifiers_mask_never_triggers` 两条回归。
+    **教训**：凡是"某个常量/空集合让条件恒真"的位运算，都必须有一个显式的空集断言；
+    发现两个模块实现同一语义时，删掉一个，别让它们并存。
+19. **工作区带 Low 完整性标签 = 真机测试全假 FAIL（2026-10-22 SEAMARK 机实测）**：
+    从打了 Low IL 的目录直接启动 exe，进程继承 Low，于是
+    ① 任务栏（explorer，Medium）拒绝 `Shell_NotifyIconW(NIM_ADD)`，返回 **err=5**，
+    程序打印 `NIM_ADD failed` 后 `return` → **进程立即退出**，表现为"双击一闪而过"；
+    ② Low 的 `probe_gesture.exe` 用 `SendInput` 注入的事件**引擎收不到** →
+    四项手势全部 `dx=0` 假 FAIL；
+    ③ Low 进程对 `%TEMP%` 无写权限 → `cargo test` 固定 3 条 config 测试 panic 于
+    `tmp_dir()` 的 `create_dir_all`（err=5）。
+    **`Copy-Item` 到 `%TEMP%` 不够**——它会连 Low 标签一起复制过去，必须显式
+    `icacls <exe> /setintegritylevel Medium`。`cargo test` 另给 `%TEMP%` 建一个
+    Low 可写子目录并改 `$env:TEMP`。
+    **教训**：真机测试前先 `icacls . | grep "Mandatory Label"`。
+    凡是"所有功能一起失效但代码没改"的现场，先排除完整性级别/权限，再怀疑代码。
+20. **数测试数量别用 `grep -c "#\[test\]"`**：`hook.rs` 的注释里有一句
+    "必须把 set_mods 的用例合并在一个 `#[test]` 里"，于是这把**注释里的字符串**
+    也数进去了，把 57 数成 58、把 hook 的 2 条数成 3 条，并扩散进 README/AGENTS/
+    testing.md 三份文档。正确写法是只匹配独占一行的属性：
+    `grep -cE '^[[:space:]]*#\[test\][[:space:]]*$'`。
+    **教训**：统计类断言（测试数、行数、条数）要么用编译器/工具的真实输出，
+    要么用能锚定行首行尾的精确模式；否则数字会一路复制到文档里没人再核对。
 
 ---
 
 ## 7. 交付物状态
 
-- `cargo test` 55/55。
+- `cargo test` 57/57。
 - exe 为**单文件**（图标 + manifest 均内嵌 PE 资源段，不依赖任何外部文件）。
 - 三处就位且 MD5 一致：`target/release/`、`%USERPROFILE%\Desktop\`、
   `%LOCALAPPDATA%\Programsnydrag-win\`（开机自启 `.lnk` 指向此处）。

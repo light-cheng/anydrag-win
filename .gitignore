@@ -21,3 +21,6 @@ resize-diag.log
 # ANYDRAG_DEBUG=1 诊断日志
 d*.log
 dbg*.log
+
+# macOS 目录元数据（不应入库）
+.DS_Store

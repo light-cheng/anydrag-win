@@ -1,0 +1,24 @@
+# 统一行尾：仓库内一律 LF，检出到 Windows 工作区时保持 LF。
+#
+# 为什么需要这个文件（2026-10-22）：仓库此前没有任何行尾约束，
+# `core.autocrlf` 也未设置。Windows 上的编辑器把 build.rs / app.rc /
+# throttle.rs / acceptance.md 整体改成了 CRLF，于是 `git status` 显示 4 个文件
+# 被修改、`git diff` 看起来像是整文件重写（+739/−739），而
+# `git diff --ignore-all-space` 是**空的**——纯行尾噪声。
+#
+# 危害不是"多几个字节"，而是**真改动会被噪声淹没**：审查时无法一眼看出哪几行
+# 是实质修改，`git blame` 也会把整文件算到换行的那次提交上。
+#
+# `-text` 关闭任何行尾转换（最严格：进也 LF、出也 LF）。
+# Rust 源码、Markdown、.rc、.bat 用 LF 都能正常构建/执行——
+# rc.exe 与 cmd.exe 都接受 LF 行尾（实测 build.bat 本就是 DOS 行尾，
+# 这里保留它的原样，不做转换以免破坏批处理解析）。
+* text=auto eol=lf
+
+# 批处理保留 CRLF：cmd.exe 对 LF-only 的 .bat 在部分情况下会解析异常。
+*.bat text eol=crlf
+
+# 二进制资源，绝不做行尾转换（否则图标会损坏）。
+*.ico binary
+*.exe binary
+*.res binary

@@ -1,4 +1,4 @@
-# anydrag-win
+![anydrag-win](assets/hero.png)
 
 Windows 版「Alt 拖窗口任意点移动」小工具：把鼠标光标停在**任意窗口的任意位置**，
 按住 **Alt 拖动**即可移动该窗口（不限于标题栏）；**Alt 双击**则最大化/还原；
@@ -57,7 +57,7 @@ target\release\anydrag-win.exe
 | 菜单项 | 行为 |
 | --- | --- |
 | **启用 / 禁用** | 即时切换手势开关，**写回配置文件并换图标**：禁用时图标变蓝圈问号 + 提示"已禁用"，随时可再切回 |
-| **设置…** | 打开**图形设置界面**（触发键、阈值、默认通道、排除名单、中键分屏），保存**立即生效，无需重启** |
+| **设置…** | 打开**图形设置界面**（触发键、阈值、排除名单、中键分屏），保存**立即生效，无需重启** |
 | **用法…** | 弹窗显示上面的手势说明与配置文件路径 |
 | **配置文件…** | 用系统默认编辑器打开 `config.json`（文件不存在时先写出模板） |
 | **退出** | 移除托盘图标、退出进程（鼠标钩子随进程退出自动卸载） |
@@ -113,7 +113,7 @@ target\release\anydrag-win.exe
    修复前手改**完全无效**：引擎只认版本号，会一直用启动时的内存快照，
    表现为"我明明改好了，怎么还是不对"，只有重启进程才生效。
 
-   `ANYDRAG_DEBUG=1` 下会打印 `[config] 已重载（file_changed=true）strategy=...` 便于确认。
+   `ANYDRAG_DEBUG=1` 下会打印 `[config] 已重载（file_changed=true）mods=[...]` 便于确认。
 
 **改触发键要注意**：引擎靠"钩子监视列表与配置一致"自愈，且比较是**内容级**的
 （`hook::mods_match`）。把 Alt 换成 Ctrl 这种"个数不变"的改动同样会刷新钩子键表
@@ -137,13 +137,17 @@ target\release\anydrag-win.exe
 ## 开发
 
 > **改这个仓库前先读 [`AGENTS.md`](AGENTS.md)** —— 架构不变量、配置热重载机制、
-> 已移除的设计（及为什么移除）、以及 14 条实测踩过的坑（定时器炸弹、背压闩锁死锁、
+> 已移除的设计（及为什么移除）、以及 20 条实测踩过的坑（定时器炸弹、背压闩锁死锁、
 > 事件环溢出、异步 placement 不一致态……）都在里面。
 
 ```bash
-cargo test            # 55 个单测（纯逻辑模块零 windows-sys）
+cargo test            # 57 个单测（纯逻辑模块零 windows-sys）
 cmd /c "build.bat"     # release 构建
 ```
+
+**完整测试流程见 [`docs/testing.md`](docs/testing.md)** —— 含环境准备、单元测试、
+真机手势冒烟（四项手势 + 探针判据）、真实场景回归、结果回填模板，
+可直接交给另一台机器上的 agent 照着执行。
 
 冒烟驱动：`target/release/probe_gesture.exe`（`frame|alt-drag|alt-dbl|ctrl-resize|middle-snap|maximize|send-save|close`，
 自动化验收用，非用户工具；跑之前它会先确认目标窗在最前，否则直接中止，避免误伤别的窗口）。
@@ -152,10 +156,18 @@ cmd /c "build.bat"     # release 构建
 
 ### 图标
 
+- **exe 文件图标**：两个错位圆角方块（后层灰描边空心、前层白填充+炭黑描边），
+  表达"一个窗口被挪到了另一个窗口上"。
+  **由脚本生成、不是手工调的二进制**：`python3 assets/icon-src/build_ico.py`
+  可重现地重建 `assets/anydrag-win.ico`（7 个尺寸逐尺寸独立光栅化，
+  这是小尺寸不糊的前提）。设计与取舍见 `assets/icon-src/README.md`。
 - **托盘图标**：运行时自绘（`src/icon.rs`），不依赖资源文件；配色即状态（蓝=启用，灰=禁用）。
-- **exe 文件图标 + 视觉样式清单**：都内嵌进 PE 资源段（`assets/anydrag-win.ico` +
-  `assets/app.rc`）。`build.rs` 调 Windows SDK 的 `rc.exe` 编译后经
-  `cargo:rustc-link-arg` 交给链接器，**不引入任何 Rust 构建依赖**
+  **有意与 exe 图标不同色**：托盘是单色剪影，深灰在深色任务栏上对比度仅 1.3:1（几乎不可见），
+  亮蓝在深浅两种任务栏上都 ≥3.4:1。两者形状语言一致，配色按各自背景约束选。
+- **README 头图**：`assets/hero.png`，同由脚本生成（`assets/icon-src/hero.py`），
+  文字用真实字体渲染而非 AI 出图（AI 会把文字画成乱码）。
+- **视觉样式清单**：内嵌进 PE 资源段（`assets/app.rc`）。`build.rs` 调 Windows SDK 的
+  `rc.exe` 编译后经 `cargo:rustc-link-arg` 交给链接器，**不引入任何 Rust 构建依赖**
   （不用 winres/embed-resource）。找不到 rc.exe 只警告不失败。
 
   因此 **exe 是单文件可分发**：不再需要旁边的 `anydrag-win.exe.manifest`。
