@@ -7,20 +7,21 @@
 diag.log
 resize-diag.log
 
-# 工作区助手记忆（本地数据，不入库）
+# 本地工具的工作目录（不是本项目产物，不入库）
 .workbuddy-ai/
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
 .pi/
 
 # ANYDRAG_DEBUG=1 诊断日志
 d*.log
 dbg*.log
+
+# 发布用的构建产物与归档：作为 GitHub Release 附件分发，不进版本库
+# （exe 425 KB 是二进制，进库会让 clone 变重，且 diff 里看不出任何东西）
+/anydrag-win.exe
+/anydrag-win.bundle
+/anydrag-win-source.zip
+# 交给下一台机器执行的发布说明，属于本机工作文件
+/README-发布说明.md
 
 # macOS 目录元数据（不应入库）
 .DS_Store

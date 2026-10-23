@@ -1,5 +1,11 @@
 # T4.2 验收证据（anydrag-win）
 
+> **历史记录（2026-10-16）**：本文件按下述 `GOAL.md` 逐条回填，是当时的原始证据。
+> `GOAL.md` 已于 2026-10-21 归档为 [`docs/archive/goal-2026-10-15.md`](archive/goal-2026-10-15.md)，
+> 工程约定改由 [`AGENTS.md`](../AGENTS.md) 承担。文中提到的 `GOAL.md`、`probe_scandrag`
+> 与 native 拖动策略均已被移除，**保留原文不改**，以免篡改验收记录。
+> 当前状态的验收见 [`docs/acceptance-2026-10-22.md`](acceptance-2026-10-22.md)。
+
 - **日期**：2026-10-16
 - **环境**：Windows 11（10.0.26300 系）/ 主屏 2880×1752 @100% DPI / git-bash /
   `rustc 1.98.1` / MSVC BuildTools `14.44.35207` / Windows SDK `10.0.22621.0`

@@ -67,14 +67,23 @@ jobs:
           }
           Write-Output "OK: PerMonitorV2 已内嵌"
 
-          # 图标资源：RT_GROUP_ICON 的字节序列不如字符串好找，
-          # 改用"exe 体积下限"做一个粗略但有效的哨兵：
-          # 无资源的 exe 约 420KB，带 17KB 多尺寸图标 + manifest 后约 426KB。
-          $size = $bytes.Length
-          if ($size -lt 424000) {
-            throw "exe 只有 $size 字节，疑似图标/manifest 未内嵌（应 >= 424000）"
+          # 图标资源：直接查 `.rsrc` 段的大小，而不是查整个 exe 的体积。
+          # 为什么不查体积（2026-10-23 改）：无资源 exe 405,504 B、带资源 425,984 B，
+          # 阈值卡在 424,000 只剩 1,984 B 余量（0.47%）。CI 用的 rustc 版本与本地
+          # 不同，`.text` 缩个 2 KB 就会**误报失败**，把"资源缺失"的真问题淹掉。
+          # 段大小与代码体积无关：图标 17 KB + manifest 2.3 KB，`.rsrc` 约 20 KB。
+          $pe = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.MemoryStream]::new($bytes))
+          try {
+            $rsrc = $pe.PEHeaders.SectionHeaders | Where-Object { $_.Name -eq ".rsrc" }
+            if (-not $rsrc) { throw "exe 里没有 .rsrc 段 —— 图标/manifest 都没内嵌" }
+            $rsrcSize = $rsrc.VirtualSize
+            if ($rsrcSize -lt 15000) {
+              throw ".rsrc 段只有 $rsrcSize 字节，疑似资源不完整（图标+manifest 应约 20000）"
+            }
+            Write-Output "OK: .rsrc 段 $rsrcSize 字节，资源已内嵌"
+          } finally {
+            $pe.Dispose()
           }
-          Write-Output "OK: exe 体积 $size 字节，资源已内嵌"
 
       - name: Upload exe
         uses: actions/upload-artifact@v4
