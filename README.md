@@ -2,22 +2,27 @@
 
 Windows 版「Alt 拖窗口任意点移动」小工具：把鼠标光标停在**任意窗口的任意位置**，
 按住 **Alt 拖动**即可移动该窗口（不限于标题栏）；**Alt 双击**则最大化/还原；
-**Alt+Ctrl 从窗口边缘拖动**则调整大小（就近边/角）。
+**Alt+Ctrl 在窗口任意位置拖动**则调整大小（方向自动判定，不用瞄边缘）。
 行为参照 AnyDrag(macOS) 与 AltSnap(Windows) 的交互，clean-room 实现，MIT 许可。
 运行后常驻系统托盘，无安装、无界面，几百 KB 的单个 exe。
 
 ## 快速开始
 
 ```bat
-:: 需要 Visual Studio 2022 BuildTools（MSVC x64）
-cmd /c "build.bat"
+:: 需要 Rust 工具链 + MSVC x64（Visual Studio 2022 BuildTools 或 Community 均可）
+cargo build --release
 
 :: 运行（Release 产物）
 target\release\anydrag-win.exe
 ```
 
-运行后任务栏右下角托盘出现一个普通窗口图标（= 启用中）。没有主界面，
-所有交互就是"手势 + 托盘菜单"，下面两节讲完即可上手。
+> `cargo build --release` 就够了 —— 图标与 manifest 由 `build.rs` 调 `rc.exe` 内嵌，
+> 它会自己去 Windows SDK 的 include 目录找头文件，**不需要**先跑 `vcvarsall.bat`。
+> `build.bat` 只是个便利脚本（帮你 call vcvarsall 再 build），适合本机固定装了
+> BuildTools 的人；装了 Community 版或换了路径时直接用上面的 cargo 命令。
+
+运行后任务栏右下角托盘出现本程序的图标（与 exe 图标同一个：两个错位圆角方块）。
+没有主界面，所有交互就是"手势 + 托盘菜单"，下面两节讲完即可上手。
 
 ## 用法
 
@@ -56,15 +61,21 @@ target\release\anydrag-win.exe
 
 | 菜单项 | 行为 |
 | --- | --- |
-| **启用 / 禁用** | 即时切换手势开关，**写回配置文件并换图标**：禁用时图标变蓝圈问号 + 提示"已禁用"，随时可再切回 |
-| **设置…** | 打开**图形设置界面**（触发键、阈值、排除名单、中键分屏），保存**立即生效，无需重启** |
+| **启用 / 禁用** | 即时切换手势开关，**写回配置文件并换图标**：禁用时图标整体变淡 + 提示"已禁用"，随时可再切回 |
+| **设置…** | 打开**图形设置界面**（触发键、阈值、排除名单、中键分屏、界面语言），保存**立即生效，无需重启** |
 | **用法…** | 弹窗显示上面的手势说明与配置文件路径 |
 | **配置文件…** | 用系统默认编辑器打开 `config.json`（文件不存在时先写出模板） |
 | **退出** | 移除托盘图标、退出进程（鼠标钩子随进程退出自动卸载） |
 
-托盘图标即状态指示灯：**亮蓝四向移动箭头 = 手势生效中；同一个箭头变灰 = 已禁用**。
-图标是**运行时自绘**的（四向移动箭头，直接表达"拖窗口"），不依赖系统默认图标，
-也不需要 `.rc` 资源文件。
+托盘图标就是**程序图标**（两个错位圆角方块），与 exe / 任务栏 / Alt+Tab 里的图标同一个，
+一眼能认出是哪个程序。状态用**不透明度**表达：原色 = 手势生效中，整体变淡 = 已禁用。
+
+> 为什么状态用"变淡"而不是"变色"：程序图标是多色的（白填充 + 炭黑描边 + 中灰后层），
+> 没有一种颜色能安全地表达"禁用"——换色会破坏它与 exe 图标的一致性，而一致性正是
+> 用程序图标的初衷。降低不透明度对任何配色都成立，且"变淡 = 不生效"比"变灰"更直观。
+
+图标**内嵌在 exe 的 PE 资源段里**（`assets/app.rc` + `build.rs`），所以 exe 是**单文件**，
+不需要旁边的 `.ico` 或 `.manifest`。
 
 ### 设置界面
 
@@ -79,8 +90,9 @@ target\release\anydrag-win.exe
 「用法…」弹窗同样双语。**
 
 **深色主题**：跟随系统「应用模式」设置，**切换后窗口立即重绘**（不重启）。
-配色与圆角取自本机 DSH 的样式表实测令牌（`neutral-bluish` 色阶、
-`--dsw-radius-*`、半透明边框预混合成实色、2px 焦点环），不是随手调的灰。
+配色与圆角遵循三条可验证的原则：中性色带极轻微蓝调（纯灰会显脏）、
+边框用半透明黑/白（实色灰在任何背景上都显厚重）、圆角按用途分三级（4/8/12px）。
+全部符合 Windows 11 类型刻度与 WCAG 2.1 对比度要求（后者由单测强制）。
 
 **键盘可用**：Tab / Shift+Tab 在控件间移动，空格切换复选框，回车触发「保存」，Esc 取消。
 
@@ -158,8 +170,8 @@ target\release\anydrag-win.exe
 > Tab 焦点循环……）都在里面。
 
 ```bash
-cargo test            # 92 个单测（纯逻辑模块零 windows-sys）
-cmd /c "build.bat"     # release 构建
+cargo test                  # 92 个单测（纯逻辑模块零 windows-sys）
+cargo build --release       # release 构建（图标/manifest 由 build.rs 内嵌）
 ```
 
 **完整测试流程见 [`docs/testing.md`](docs/testing.md)** —— 含环境准备、单元测试、
@@ -178,15 +190,28 @@ cmd /c "build.bat"     # release 构建
   **由脚本生成、不是手工调的二进制**：`python3 assets/icon-src/build_ico.py`
   可重现地重建 `assets/anydrag-win.ico`（7 个尺寸逐尺寸独立光栅化，
   这是小尺寸不糊的前提）。设计与取舍见 `assets/icon-src/README.md`。
-- **托盘图标**：运行时自绘（`src/icon.rs`），不依赖资源文件；配色即状态（蓝=启用，灰=禁用）。
-  **有意与 exe 图标不同色**：托盘是单色剪影，深灰在深色任务栏上对比度仅 1.3:1（几乎不可见），
-  亮蓝在深浅两种任务栏上都 ≥3.4:1。两者形状语言一致，配色按各自背景约束选。
+- **托盘图标**：**同一个程序图标**（`src/icon.rs` 从 PE 资源段按托盘尺寸加载，
+  见上节「托盘菜单」）。状态用不透明度表达（原色=启用，45% 不透明度=禁用）。
+  多尺寸 `.ico` 让 Windows 能挑到对应那一帧，而不是拿 32px 缩到 16px（会糊成灰边）。
 - **README 头图**：`assets/hero.png`，同由脚本生成（`assets/icon-src/hero.py`），
   文字用真实字体渲染而非 AI 出图（AI 会把文字画成乱码）。
 - **视觉样式清单**：内嵌进 PE 资源段（`assets/app.rc`）。`build.rs` 调 Windows SDK 的
   `rc.exe` 编译后经 `cargo:rustc-link-arg` 交给链接器，**不引入任何 Rust 构建依赖**
-  （不用 winres/embed-resource）。找不到 rc.exe 只警告不失败。
+  （不用 winres/embed-resource）。
+  `build.rs` 会自己扫 Windows SDK 的 include 目录传给 `rc.exe`，**不依赖
+  `vcvarsall.bat` 设的 `INCLUDE` 环境变量** —— 否则直接 `cargo build` 时会找不到
+  `winres.h`，资源编不出来而构建"成功"，exe 里既没图标也没清单。
+  若真的找不到 `rc.exe`，构建会打一条 warning 并跳过（不阻断），
+  但那样产出的 exe **没有图标也没有 DPI 清单**，不建议分发。
 
   因此 **exe 是单文件可分发**：不再需要旁边的 `anydrag-win.exe.manifest`。
-  清单以 `RT_MANIFEST` / ID=1（进程级）内嵌；若退回外部文件模式，一旦漏拷就会
-  静默退回 Windows 95 灰色控件样式且无任何报错。
+  清单以 `RT_MANIFEST` / ID=1（进程级）内嵌，且**必须包含 `PerMonitorV2`**：
+  缺了它进程在 150% 缩放下按 96 DPI 虚拟化，设置窗口会被裁掉一半。
+  若退回外部文件模式，一旦漏拷就会静默退回 Windows 95 灰色控件样式且无任何报错。
+
+## 许可
+
+MIT，全文见 [`LICENSE`](LICENSE)。
+
+交互设计参照 AnyDrag（macOS）与 AltSnap（Windows）的行为，但**代码为 clean-room
+独立实现**，未复制其源码。

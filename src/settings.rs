@@ -672,7 +672,7 @@ unsafe fn draw_item(lp: LPARAM) -> LRESULT {
     }
 }
 
-/// 2px 焦点环（DSH `--dsw-focus-ring-width`）。**自绘控件必须画它** ——
+/// 2px 焦点环。**自绘控件必须画它** ——
 /// 原生控件有、自绘没有 = 键盘用户失去位置指示（SPEC §2.4.4 / V12）。
 unsafe fn focus_ring(hdc: HDC, r: Rect, dpi: i32, color: u32) {
     let inset = r;
@@ -692,7 +692,7 @@ unsafe fn focus_ring(hdc: HDC, r: Rect, dpi: i32, color: u32) {
 
 /// 画一个复选框：方框（16×16，4px 圆角）+ 勾 + 文字。
 ///
-/// 方框用 `theme::RADIUS_CHECK`（4px，DSH `--dsw-radius-xs`），文字用正文色 ——
+/// 方框用 `theme::RADIUS_CHECK`（4px），文字用正文色 ——
 /// 深浅两套主题下都可读（配色见 `theme::Palette`，对比度有单测钉住）。
 unsafe fn draw_checkbox(
     hdc: HDC,

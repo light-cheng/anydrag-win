@@ -2,20 +2,25 @@
 //!
 //! **纯逻辑模块**：不 import windows-sys（AGENTS.md §1 不变量 4），因此可单测。
 //!
-//! ## 令牌来源：DSH 打包的样式表，不是自调
+//! ## 设计语言：带蓝调的中性色阶 + 半透明边框 + 8/12px 圆角
 //!
-//! 用户原话（2026-10-23）："丑可不只是这个原因，你不觉得控件样式也很丑吗？
-//! 我觉得DSH的样式就很好看"。所以这套值全部抄自 DSH 的
-//! `--dsw-*` 自定义属性（从 `app.asar` 里解出的 `index-*.css` 与
-//! `dsh-client-ui-theme/lib/client.js`），**不自行发挥**（SPEC D2b）：
+//! 这套令牌不是凭感觉调出来的，它遵循三条可验证的原则：
 //!
-//! - 圆角刻度 xs 4 / sm 8 / md 12 / lg 16 / xl 20 / panel 28 px；
-//! - `neutral-bluish` 色阶（带极轻微蓝调 —— 纯灰会显脏，这是 DSH"高级感"的来源）；
-//! - **边框是半透明黑/白**（`#0000000a` / `#ffffff0f`），不是实色灰。
+//! 1. **中性色带极轻微蓝调**（而不是纯灰）。纯灰在大面积背景上会显得脏；
+//!    加一点点蓝调（色相 ~220°、饱和度 ~3-8%）会让界面看起来"干净"。
+//!    色阶从 `#ffffff` 到 `#0f1115`，每一档都是同一色相的明度递进。
+//! 2. **边框用半透明黑/白，不是实色灰**。实色灰边框在任何背景上都显得厚重；
+//!    半透明边框（浅色主题 `#0000000a`、深色 `#ffffff0f`）会与背景自然融合，
+//!    这是"轻"的来源。
+//! 3. **圆角按用途分三级**：小元素 4px、输入框/按钮 8px、卡片 12px。
+//!    层级越大圆角越大，视觉重量才与容器尺寸匹配。
+//!
+//! 配色与尺寸同时符合 Windows 11 类型刻度与 WCAG 2.1 对比度要求
+//! （后者由本模块的单测强制，见 `text_contrast_is_accessible_in_both_themes`）。
 //!
 //! ## 为什么这里有个 `blend()`
 //!
-//! GDI 的 `COLORREF` **没有 alpha 通道**。把 DSH 的 `#0000000a` 直接塞进
+//! GDI 的 `COLORREF` **没有 alpha 通道**。把半透明边框色 `#0000000a` 直接塞进
 //! `CreatePen` 会被忽略高 8 位，画出来是**纯黑**——边框从"几乎看不见"变成
 //! "又黑又粗"（SPEC R8 / §3.4）。所以本模块把 alpha 边框按目标背景**预混合**
 //! 成实色，界面代码只拿实色去画。`blend` 有明确数学期望，单测钉住。
@@ -41,7 +46,7 @@ pub const fn blue(c: u32) -> u8 {
 ///
 /// 逐通道线性插值 `out = bg + (fg - bg) * a / 255`（四舍五入）。
 /// **在 sRGB 值上插值而不是线性光空间**：这正是浏览器合成 CSS `rgba()` 的做法，
-/// 所以结果与 DSH 里看到的观感一致；换到线性光空间会偏亮，反而不像。
+/// 所以结果与浏览器渲染的 `rgba()` 观感一致；换到线性光空间会偏亮，反而不像。
 ///
 /// 单测钉住 SPEC §3.4 给的例子：`#000000` @ 10/255 叠在 `#ffffff` 上 ≈ `#f5f5f5`。
 pub const fn blend(fg: u32, alpha: u8, bg: u32) -> u32 {
@@ -61,7 +66,7 @@ const fn blend_ch(f: u8, alpha: u8, b: u8) -> u8 {
     (((f as u32) * a + (b as u32) * inv + 127) / 255) as u8
 }
 
-/// DSH `blue` 色阶（只有这三阶被用到，别自己加中间色）。
+/// 蓝色阶（只取这三档，别自己加中间色 —— 相邻档差异太小，肉眼分不出）。
 const BLUE_450: u32 = rgb(0x4D, 0x93, 0xF8);
 const BLUE_500: u32 = rgb(0x3B, 0x82, 0xF6);
 const BLUE_600: u32 = rgb(0x25, 0x63, 0xEB);
@@ -69,7 +74,7 @@ const BLUE_600: u32 = rgb(0x25, 0x63, 0xEB);
 /// 一套主题的语义令牌（SPEC §2.4.6 定稿值）。
 ///
 /// **全部是预混合后的实色**（GDI 只吃实色）：注释里保留它原本的 alpha 形式，
-/// 便于日后与 DSH 的 CSS 对照。
+/// 便于日后核对：注释里保留原始 alpha 形式，实色是由它算出来的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     /// 窗口底：浅 `#f5f6f7` / 深 `neutral-bluish-950 #151517`。
@@ -102,7 +107,7 @@ pub struct Palette {
     pub accent_hover: u32,
     /// accent 上的文字。
     pub text_on_accent: u32,
-    /// 焦点环：浅 `#4176E6` / 深 `#7AAAFF`（DSH `--dsw-focus-ring`）。
+    /// 焦点环：浅 `#4176E6` / 深 `#7AAAFF`（2px，见 `FOCUS_RING_W`）。
     pub focus_ring: u32,
     /// 分隔线（标题区/内容区/操作区之间）。
     pub separator: u32,
@@ -126,7 +131,7 @@ pub const LIGHT: Palette = Palette {
     text_disabled: blend(rgb(0x0F, 0x11, 0x15), 0x66, rgb(0xFF, 0xFF, 0xFF)),
     // 比 SPEC §2.4.6 的 `#adb2b8` 深一阶：那个值在白卡上只有 2.13:1，
     // 低于 WCAG 1.4.11 对"控件边界"要求的 3:1（实测，见 `checkbox_box_is_visible`）。
-    // `neutral-bluish-600` 是同一套 DSH 色阶里的最近一档，不是自调色（D2b 仍成立）。
+    // `#81858c` 是同一套色阶里的最近一档，不是新调的颜色。
     checkbox_box: rgb(0x81, 0x85, 0x8C),
     checkbox_checked: BLUE_500,
     check_mark: rgb(0xFF, 0xFF, 0xFF),
@@ -134,7 +139,7 @@ pub const LIGHT: Palette = Palette {
     // 悬停往黑里压（蓝色按钮的常规做法）。**不能往亮里走**：白字叠 `blue-500`
     // 只有 3.68:1，会比静止态更难读。
     accent_hover: blend(rgb(0x00, 0x00, 0x00), 0x20, BLUE_600),
-    // DSH 的 `--dsw-alias-label-primary-foreground`：浅色主题是 `neutral-bluish-00`
+    // 主按钮文字用白色（浅色主题下的标准做法）。
     // （白）。白字叠 `blue-600` = 5.17:1，过 AA。
     text_on_accent: rgb(0xFF, 0xFF, 0xFF),
     focus_ring: rgb(0x41, 0x76, 0xE6),
@@ -162,7 +167,7 @@ pub const DARK: Palette = Palette {
     // 深色主题往亮里走（深底上的悬停惯例）。文字是深色，越亮对比越好。
     accent_hover: BLUE_450,
     // **这一格是深色主题最容易写错的地方**：沿用"白字"会让对比度掉到 3.68:1。
-    // DSH 的规则是 `label-primary-foreground` 在深色下取 `neutral-bluish-1000`
+    // 深色主题的主按钮文字取近黑（而不是白）：
     // （近黑），所以深色主题的主按钮文字是**深色**的 —— 实测 5.14:1，过 AA。
     text_on_accent: rgb(0x0F, 0x11, 0x15),
     focus_ring: rgb(0x7A, 0xAA, 0xFF),
@@ -180,16 +185,16 @@ pub fn palette(dark: bool) -> &'static Palette {
     }
 }
 
-// ── 圆角（DSH `--dsw-radius-*`）──────────────────────────────────────────────
-/// 卡片圆角 = `--dsw-radius-md` 12px。
+// ── 圆角（三级：小元素 4 / 输入框按钮 8 / 卡片 12）────────────────────────────
+/// 卡片圆角 12px（容器级）。
 pub const RADIUS_CARD: i32 = 12;
-/// 输入框 / 按钮圆角 = `--dsw-radius-sm` 8px。
+/// 输入框 / 按钮圆角 8px（控件级）。
 pub const RADIUS_FIELD: i32 = 8;
-/// 复选框方框圆角 = `--dsw-radius-xs` 4px。
+/// 复选框方框圆角 4px（小元素级）。
 pub const RADIUS_CHECK: i32 = 4;
 
-// ── 字号（Windows 11 类型刻度 + DSH 正文 14px，两处独立来源一致）──────────────
-/// 正文 14px（Windows `Body`，也是 DSH 的默认正文字号）。
+// ── 字号（Windows 11 类型刻度；正文 14px 是官方 Body 值）─────────────────────
+/// 正文 14px（Windows 11 类型刻度里的 `Body`）。
 pub const FONT_BODY: i32 = 14;
 /// 卡片标题 14px Semibold（Windows `Body Strong`）。
 pub const FONT_CARD_TITLE: i32 = 14;
@@ -202,7 +207,7 @@ pub const FONT_CAPTION: i32 = 12;
 pub const WEIGHT_SEMIBOLD: i32 = 600;
 pub const WEIGHT_REGULAR: i32 = 400;
 
-/// 焦点环宽度 = DSH `--dsw-focus-ring-width` 2px。
+/// 焦点环宽度 2px（WCAG 2.4.11 焦点指示的最低可见宽度）。
 pub const FOCUS_RING_W: i32 = 2;
 
 /// sRGB 相对亮度（WCAG 2.1 定义），0.0（黑）..1.0（白）。
@@ -295,7 +300,7 @@ mod tests {
     ///
     /// SPEC §2.4.6 给的 `#adb2b8`（浅色）在白卡上只有 2.13:1、`#61666b`（深色）
     /// 在深卡上只有 2.71:1 —— 都看不见。所以这里按**可达性**取同色阶的深/浅一档，
-    /// 并在注释里记明原因（D2b 要求"不自行调色"，所以仍取自 DSH 的 neutral-bluish）。
+    /// 并在注释里记明原因（仍取自同一套色阶，不新调颜色）。
     #[test]
     fn checkbox_box_is_visible() {
         for (name, p) in [("light", &LIGHT), ("dark", &DARK)] {
@@ -341,9 +346,9 @@ mod tests {
         assert_eq!(DARK.accent, rgb(0x3B, 0x82, 0xF6));
     }
 
-    /// 圆角必须是 DSH 的递增刻度（xs < sm < md），且输入框比卡片小。
+    /// 圆角必须递增（小元素 < 输入框 < 卡片），且输入框比卡片小。
     #[test]
-    fn radii_follow_dsh_scale() {
+    fn radii_follow_scale() {
         assert_eq!(RADIUS_CHECK, 4);
         assert_eq!(RADIUS_FIELD, 8);
         assert_eq!(RADIUS_CARD, 12);

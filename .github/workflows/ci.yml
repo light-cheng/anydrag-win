@@ -1,0 +1,84 @@
+name: CI
+
+# 为什么需要 CI（2026-10-23 加）：本仓的构建依赖一个**容易被忽略的隐式前提** ——
+# `build.rs` 要用 Windows SDK 的 `rc.exe` 编资源（图标 + manifest）。
+# 曾经它只在 `build.bat`（先 call vcvarsall）下才成功，直接 `cargo build` 会
+# 静默产出一个**没有图标也没有 DPI 清单**的 exe，而构建仍然"成功"。
+# 本地开发很难发现这种事（谁没事看 exe 里有没有资源段），
+# 所以把"干净环境能否构建 + 产物是否真的带资源"钉在 CI 里。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test + build (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # 格式与 lint 只做提示，不阻断：本仓的注释密度很高，
+      # 让 rustfmt 重排会毁掉"为什么这么做"的排版。
+      - name: cargo fmt --check (non-blocking)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+
+      # **关键一步**：不跑 build.bat，直接 cargo build。
+      # 这模拟"新克隆仓库的人第一次构建"，能抓出对 vcvarsall 的隐式依赖。
+      - name: cargo build --release
+        run: cargo build --release
+
+      # **构建后校验**：资源真的进 exe 了吗？
+      # 只检查"构建退出码为 0"是不够的 —— 缺资源时 build.rs 只打一条
+      # cargo:warning 就跳过，构建照样成功。
+      - name: Verify resources embedded
+        shell: pwsh
+        run: |
+          $exe = "target\release\anydrag-win.exe"
+          if (-not (Test-Path $exe)) { throw "构建产物不存在: $exe" }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+
+          # manifest 里的 DPI 声明。缺了它，进程在 150% 缩放下会被系统按 96 DPI
+          # 虚拟化，设置窗口被裁掉一半（实测过，且没有任何报错）。
+          if (-not $ascii.Contains("PerMonitorV2")) {
+            throw "exe 里没有 PerMonitorV2 —— manifest 没内嵌，DPI 感知会失效"
+          }
+          Write-Output "OK: PerMonitorV2 已内嵌"
+
+          # 图标资源：RT_GROUP_ICON 的字节序列不如字符串好找，
+          # 改用"exe 体积下限"做一个粗略但有效的哨兵：
+          # 无资源的 exe 约 420KB，带 17KB 多尺寸图标 + manifest 后约 426KB。
+          $size = $bytes.Length
+          if ($size -lt 424000) {
+            throw "exe 只有 $size 字节，疑似图标/manifest 未内嵌（应 >= 424000）"
+          }
+          Write-Output "OK: exe 体积 $size 字节，资源已内嵌"
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: anydrag-win-release
+          path: target/release/anydrag-win.exe
+          if-no-files-found: error
